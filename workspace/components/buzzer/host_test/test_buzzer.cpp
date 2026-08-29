@@ -61,7 +61,7 @@ static std::string join(const std::vector<Step>& v)
 // sleeps exactly as long as nextDelayMs() asks for.
 class Sim {
 public:
-    explicit Sim(const BuzzerConfig& cfg, uint32_t startMs = 0)
+    explicit Sim(const BuzzerSpec& cfg, uint32_t startMs = 0)
         : bz_(cfg), t_(startMs)
     {
     }
@@ -106,21 +106,19 @@ private:
     uint32_t t_;
 };
 
-static BuzzerConfig passiveCfg()
+static BuzzerSpec passiveCfg()
 {
-    BuzzerConfig c{};
-    c.pin       = 0;
+    BuzzerSpec c{};
     c.type      = BuzzerType::PASSIVE;
-    c.activeLow = false;
     c.maxVolume = 100;
     c.minFreqHz = 100;
     c.maxFreqHz = 10000;
     return c;
 }
 
-static BuzzerConfig activeCfg()
+static BuzzerSpec activeCfg()
 {
-    BuzzerConfig c = passiveCfg();
+    BuzzerSpec c = passiveCfg();
     c.type         = BuzzerType::ACTIVE;
     return c;
 }
@@ -273,7 +271,7 @@ static const Note kTooHigh[] = {{20000, 40, 100}};
 
 static void test_frequency_out_of_range_is_silent()
 {
-    BuzzerConfig c = passiveCfg();
+    BuzzerSpec c = passiveCfg();
     c.maxFreqHz    = 10000;
     Sim s(c);
     s.bz().play(makePattern(kTooHigh), s.now());
@@ -302,7 +300,7 @@ static const Note kFullVolume[] = {{2700, 40, 100}};
 
 static void test_volume_clamped_by_max()
 {
-    BuzzerConfig c = passiveCfg();
+    BuzzerSpec c = passiveCfg();
     c.maxVolume    = 40;
     Sim s(c);
     s.bz().play(makePattern(kFullVolume), s.now());

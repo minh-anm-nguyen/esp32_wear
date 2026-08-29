@@ -1,5 +1,9 @@
 // Pure logic layer: a sequencer that walks a pattern of notes over time.
-// No dependency on LEDC or FreeRTOS, so it compiles on a PC with g++.
+//
+// This header includes nothing but <cstddef> and <cstdint>. No LEDC, no
+// FreeRTOS, and no #ifdef ESP_PLATFORM shim -- it used to fake a gpio_num_t for
+// host builds purely because BuzzerConfig carried a `pin` the sequencer never
+// read. The wiring now lives in buzzer_manager.hpp and the shim is gone.
 //
 // Mirror image of button.hpp: Button turns pin levels into events, Buzzer turns
 // elapsed time into output commands. Same three layers, opposite direction.
@@ -8,13 +12,6 @@
 
 #include <cstddef>
 #include <cstdint>
-
-#ifdef ESP_PLATFORM
-#include "driver/gpio.h"
-#else
-// Host build fallback: just enough to represent a pin number.
-using gpio_num_t = int;
-#endif
 
 namespace buzzer {
 
@@ -68,10 +65,13 @@ constexpr Pattern makePattern(const Note (&notes)[N],
     return Pattern{notes, static_cast<uint8_t>(N), repeat, priority};
 }
 
-struct BuzzerConfig {
-    gpio_num_t pin{};
+// What the DEVICE can do -- the four facts the sequencer needs in order to
+// decide whether a note is playable and how loud it may be.
+//
+// Nothing about how it is wired: that is BuzzerWiring, in buzzer_manager.hpp.
+// Splitting the two is what let this header drop its gpio_num_t shim.
+struct BuzzerSpec {
     BuzzerType type{BuzzerType::PASSIVE};
-    bool       activeLow{false};   // true when the driver stage inverts the pin
     uint8_t    maxVolume{100};     // hardware ceiling, clamps every Note::volume
     uint16_t   minFreqHz{100};     // PASSIVE only: outside the range -> silent
     uint16_t   maxFreqHz{10000};
@@ -96,7 +96,7 @@ inline constexpr uint32_t kSleepForever = UINT32_MAX;
 
 class Buzzer {
 public:
-    explicit Buzzer(const BuzzerConfig& config);
+    explicit Buzzer(const BuzzerSpec& spec);
 
     // Returns false when refused: an empty pattern, or one whose priority is
     // strictly below the pattern currently playing. Equal priority replaces on
@@ -130,9 +130,8 @@ public:
     }
 
     BuzzerState getState() const { return state_; }
-    gpio_num_t  pin()      const { return config_.pin; }
 
-    const BuzzerConfig& config() const { return config_; }
+    const BuzzerSpec& spec() const { return spec_; }
 
     // Index of the note being played. Meaningless while IDLE.
     uint8_t noteIndex() const { return noteIndex_; }
@@ -145,8 +144,8 @@ private:
     void    loadNote(uint32_t nowMs);
     bool    advance(uint32_t nowMs);
 
-    BuzzerConfig config_;
-    Pattern      pattern_{};
+    BuzzerSpec spec_;
+    Pattern    pattern_{};
 
     BuzzerState state_{BuzzerState::IDLE};
     bool        outputPending_{false};

@@ -1,17 +1,18 @@
 // Pure logic layer: debounce + FSM.
-// No dependency on GPIO or FreeRTOS, so it compiles on a PC with g++.
+//
+// This header includes NOTHING. No GPIO, no FreeRTOS, no ESP-IDF, and no
+// #ifdef ESP_PLATFORM shim either -- it compiles on a PC exactly as it compiles
+// on the chip, because there is no longer anything platform-shaped in it.
+//
+// It used to carry `using gpio_num_t = int;` for host builds. That shim existed
+// for exactly one reason: ButtonConfig held a `pin` this layer never used for
+// any decision. Splitting the wiring out (ButtonWiring, in button_manager.hpp)
+// removed the field and the shim with it.
+//
 // See doc-design/button-esp-idf-design.md sections 5, 8, 9.
 #pragma once
 
 #include <cstdint>
-
-#ifdef ESP_PLATFORM
-#include "driver/gpio.h"
-#include "freertos/FreeRTOS.h"
-#else
-// Host build fallback: just enough to represent a pin number.
-using gpio_num_t = int;
-#endif
 
 namespace button {
 
@@ -34,11 +35,13 @@ enum class ButtonEvent : uint8_t {
     LONG_PRESS_RELEASE,
 };
 
-struct ButtonConfig {
-    gpio_num_t pin{};
-    bool       activeLow{true};
-    bool       enableInternalPull{true};
-    bool       enableDoubleClick{true};
+// How the button should BEHAVE. Nothing here says anything about how it is
+// wired -- that is ButtonWiring, and it belongs to the manager.
+//
+// Every field is a gesture parameter this layer either reads directly or (for
+// debounceMs) converts into one through debounceCountFor().
+struct ButtonBehavior {
+    bool     enableDoubleClick{true};
 
     // Off by default, because turning it on inserts an extra event in front of
     // every gesture and would change the sequence an existing app receives.
@@ -49,50 +52,17 @@ struct ButtonConfig {
     // while the FSM rules out a second press (§9.2), which is a delay a finger
     // can feel. PRESS_DOWN reports the pin, not a gesture, so nothing is pending
     // and it goes out as soon as the debounce integrator settles.
-    bool       enablePressDown{false};
+    bool     enablePressDown{false};
 
-    uint32_t   longPressMs{800};
-    uint32_t   doubleClickMs{250};
-    uint32_t   debounceMs{20};   // real time; the cycle count is derived from it
+    uint32_t longPressMs{800};
+    uint32_t doubleClickMs{250};
+
+    // Real time. Button itself never reads this field: the CALLER turns it into
+    // a cycle count with debounceCountFor() and passes that to the constructor,
+    // because only the caller knows the poll interval. It stays here, next to
+    // the other timings, so a single struct describes the whole gesture feel.
+    uint32_t debounceMs{20};
 };
-
-// ------------------------------------------------- tick-rate independence (§5)
-
-#ifdef ESP_PLATFORM
-
-inline constexpr uint32_t kMinPreferredPollMs = 5;
-
-// Layer 0: the default adapts itself. HZ=100 -> 10ms; HZ=1000 -> 5ms.
-inline constexpr uint32_t kDefaultPollIntervalMs =
-    (portTICK_PERIOD_MS > kMinPreferredPollMs)
-        ? static_cast<uint32_t>(portTICK_PERIOD_MS)
-        : kMinPreferredPollMs;
-
-static_assert(pdMS_TO_TICKS(kDefaultPollIntervalMs) > 0,
-              "kDefaultPollIntervalMs truncates to 0 FreeRTOS ticks");
-
-namespace detail {
-// Declared but never defined, and deliberately not constexpr. Calling it from a
-// consteval context makes the constant expression fail, and the compiler quotes
-// this name back. The function name IS the error message.
-uint32_t pollIntervalMs_is_below_one_FreeRTOS_tick__raise_it_or_raise_CONFIG_FREERTOS_HZ();
-}  // namespace detail
-
-// Layer 1: reject a bad literal supplied by the caller, at compile time.
-//   cfg.pollIntervalMs = button::PollMs(5);   // HZ=100 -> compile error
-//
-// Do NOT use 'throw' here: ESP-IDF builds with -fno-exceptions, and GCC rejects
-// the throw keyword during parsing, even inside a branch that only ever runs at
-// compile time.
-consteval uint32_t PollMs(uint32_t ms)
-{
-    if (pdMS_TO_TICKS(ms) == 0) {
-        detail::pollIntervalMs_is_below_one_FreeRTOS_tick__raise_it_or_raise_CONFIG_FREERTOS_HZ();
-    }
-    return ms;
-}
-
-#endif  // ESP_PLATFORM
 
 // Convert debounceMs into a number of poll cycles (ceil), clamped to [1, 255].
 // Free function, pure arithmetic, so host tests can call it directly.
@@ -118,18 +88,20 @@ public:
     // debounceMaxCnt == 0 is forced to 1: with 0 the integrator's two thresholds
     // collapse onto each other and stableState_ latches at one value forever
     // (see section 8 of the design document).
-    Button(const ButtonConfig& config, uint8_t debounceMaxCnt);
+    Button(const ButtonBehavior& behavior, uint8_t debounceMaxCnt);
 
-    // Call once per poll cycle. rawPressed is already normalised for activeLow
+    // Call once per poll cycle. rawPressed is already normalised for the wiring
     // (true means pressed). Returns ONE event, or NONE.
     // Precedence rule: edges first, timeouts second (§9.2).
     ButtonEvent update(bool rawPressed, uint32_t nowMs);
 
     bool        isPressed() const { return stableState_; }
     ButtonState getState()  const { return fsmState_; }
-    gpio_num_t  pin()       const { return config_.pin; }
 
-    const ButtonConfig& config() const { return config_; }
+    const ButtonBehavior& behavior() const { return behavior_; }
+
+    // The cycle count actually in force, after the zero clamp.
+    uint8_t debounceMaxCnt() const { return debounceMaxCnt_; }
 
     // Timestamp of the press edge that STARTED the current gesture. It is never
     // updated mid-gesture, so for DOUBLE_CLICK it still refers to the first
@@ -149,8 +121,8 @@ public:
 private:
     void updateDebounce(bool rawPressed);
 
-    ButtonConfig config_;
-    uint8_t      debounceMaxCnt_;
+    ButtonBehavior behavior_;
+    uint8_t        debounceMaxCnt_;
 
     uint8_t     debounceCounter_{0};
     bool        stableState_{false};

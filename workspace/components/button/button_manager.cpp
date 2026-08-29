@@ -3,6 +3,7 @@
 #include <cinttypes>
 
 #include "esp_log.h"
+#include "esp_sleep.h"
 #include "esp_timer.h"
 
 namespace button {
@@ -30,33 +31,39 @@ ButtonManager::~ButtonManager()
 
 // ----------------------------------------------------------------- configuration
 
-esp_err_t ButtonManager::configureGpio(const ButtonConfig& config)
+esp_err_t ButtonManager::configureGpio(const ButtonWiring& wiring)
 {
-    bool pull = config.enableInternalPull;
+    bool pull = wiring.enableInternalPull;
 
     // Input-only pins (34-39 on the original ESP32) have no internal pull
     // resistors. The ESP32-S3 has none of those; this branch exists for
     // portability across the family.
-    if (pull && !GPIO_IS_VALID_OUTPUT_GPIO(config.pin)) {
+    if (pull && !GPIO_IS_VALID_OUTPUT_GPIO(wiring.pin)) {
         ESP_LOGW(TAG,
                  "GPIO%d la input-only: khong co tro keo noi bo, can tro ngoai",
-                 static_cast<int>(config.pin));
+                 static_cast<int>(wiring.pin));
         pull = false;
     }
 
     gpio_config_t io{};
-    io.pin_bit_mask = 1ULL << static_cast<uint32_t>(config.pin);
+    io.pin_bit_mask = 1ULL << static_cast<uint32_t>(wiring.pin);
     io.mode         = GPIO_MODE_INPUT;
-    io.pull_up_en   = (pull && config.activeLow)  ? GPIO_PULLUP_ENABLE
+    io.pull_up_en   = (pull && wiring.activeLow)  ? GPIO_PULLUP_ENABLE
                                                   : GPIO_PULLUP_DISABLE;
-    io.pull_down_en = (pull && !config.activeLow) ? GPIO_PULLDOWN_ENABLE
+    io.pull_down_en = (pull && !wiring.activeLow) ? GPIO_PULLDOWN_ENABLE
                                                   : GPIO_PULLDOWN_DISABLE;
     io.intr_type    = GPIO_INTR_ANYEDGE;
 
     return gpio_config(&io);
 }
 
-esp_err_t ButtonManager::addButton(const ButtonConfig& config)
+esp_err_t ButtonManager::addButton(const ButtonWiring& wiring)
+{
+    return addButton(wiring, ButtonBehavior{});
+}
+
+esp_err_t ButtonManager::addButton(const ButtonWiring&    wiring,
+                                   const ButtonBehavior& behavior)
 {
     // Cheap checks first, side effects last.
     if (started_) {
@@ -64,30 +71,34 @@ esp_err_t ButtonManager::addButton(const ButtonConfig& config)
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (!GPIO_IS_VALID_GPIO(config.pin)) {
+    if (!GPIO_IS_VALID_GPIO(wiring.pin)) {
         ESP_LOGE(TAG, "GPIO%d khong hop le tren chip nay",
-                 static_cast<int>(config.pin));
+                 static_cast<int>(wiring.pin));
         return ESP_ERR_INVALID_ARG;
     }
 
-    for (const auto& b : buttons_) {
-        if (b.pin() == config.pin) {
+    for (const auto& e : buttons_) {
+        if (e.wiring.pin == wiring.pin) {
             // Two Buttons on one pin means the app receives every press twice.
             ESP_LOGE(TAG, "GPIO%d da duoc them roi",
-                     static_cast<int>(config.pin));
+                     static_cast<int>(wiring.pin));
             return ESP_ERR_INVALID_ARG;
         }
     }
 
-    const esp_err_t err = configureGpio(config);
+    const esp_err_t err = configureGpio(wiring);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "gpio_config(GPIO%d) that bai: %s",
-                 static_cast<int>(config.pin), esp_err_to_name(err));
+                 static_cast<int>(wiring.pin), esp_err_to_name(err));
         return err;
     }
 
-    buttons_.emplace_back(config,
-                          debounceCountFor(config.debounceMs, config_.pollIntervalMs));
+    // debounceMs -> cycle count happens HERE, because only the manager knows the
+    // poll interval. That is exactly why Button takes a count, not a duration.
+    buttons_.push_back(Entry{
+        wiring,
+        Button{behavior,
+               debounceCountFor(behavior.debounceMs, config_.pollIntervalMs)}});
     return ESP_OK;
 }
 
@@ -115,8 +126,8 @@ esp_err_t ButtonManager::start()
     }
 
     stopRequested_.store(false, std::memory_order_release);
-    for (auto& b : buttons_) {
-        b.reset();  // do not inherit the FSM state of a previous run
+    for (auto& e : buttons_) {
+        e.logic.reset();  // do not inherit the FSM state of a previous run
     }
 
     eventQueue_ = xQueueCreate(config_.queueLength, sizeof(ButtonEventMsg));
@@ -146,8 +157,10 @@ esp_err_t ButtonManager::start()
     }
 
     // The ISR service is a system-wide resource. Another component having
-    // installed it already is not an error.
-    esp_err_t err = gpio_install_isr_service(0);
+    // installed it already is not an error -- and in that case config_.isrFlags
+    // is silently ignored, because the first caller's flags are the ones that
+    // took effect. See the comment on Config::isrFlags.
+    esp_err_t err = gpio_install_isr_service(config_.isrFlags);
     if (err == ESP_ERR_INVALID_STATE) {
         isrServiceOwned_ = false;
     } else if (err != ESP_OK) {
@@ -160,15 +173,50 @@ esp_err_t ButtonManager::start()
 
     // Arm the event source LAST: from here on an interrupt may fire at any moment.
     for (size_t i = 0; i < buttons_.size(); ++i) {
-        err = gpio_isr_handler_add(buttons_[i].pin(), isrHandler, taskHandle_);
+        err = gpio_isr_handler_add(buttons_[i].wiring.pin, isrHandler, taskHandle_);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "gpio_isr_handler_add(GPIO%d) that bai: %s",
-                     static_cast<int>(buttons_[i].pin()), esp_err_to_name(err));
+                     static_cast<int>(buttons_[i].wiring.pin), esp_err_to_name(err));
             for (size_t j = 0; j < i; ++j) {
-                gpio_isr_handler_remove(buttons_[j].pin());
+                gpio_isr_handler_remove(buttons_[j].wiring.pin);
             }
             teardownTask();
             return err;
+        }
+    }
+
+    // Light-sleep wake sources, armed after the interrupts so a press during
+    // setup is handled by the running path rather than by a half-armed one.
+    //
+    // gpio_wakeup_enable() takes LEVEL triggers only, so the pressed level is
+    // what wakes us, not the edge -- see ButtonWiring::enableWakeup. The ANYEDGE
+    // configuration set in configureGpio() stays untouched and keeps serving the
+    // running interrupt; the two coexist on the same pin.
+    bool anyWakeup = false;
+    for (auto& e : buttons_) {
+        if (!e.wiring.enableWakeup) {
+            continue;
+        }
+        const gpio_int_type_t level = e.wiring.activeLow ? GPIO_INTR_LOW_LEVEL
+                                                         : GPIO_INTR_HIGH_LEVEL;
+        const esp_err_t werr = gpio_wakeup_enable(e.wiring.pin, level);
+        if (werr != ESP_OK) {
+            // Not fatal: the button still works, the watch just will not wake on
+            // it. Failing start() over this would take the whole UI down.
+            ESP_LOGW(TAG, "gpio_wakeup_enable(GPIO%d) that bai: %s",
+                     static_cast<int>(e.wiring.pin), esp_err_to_name(werr));
+            continue;
+        }
+        anyWakeup = true;
+    }
+
+    if (anyWakeup) {
+        // Enables the GPIO wake source itself. Additive and idempotent, so other
+        // drivers (touch, IMU) calling it too is fine.
+        const esp_err_t serr = esp_sleep_enable_gpio_wakeup();
+        if (serr != ESP_OK) {
+            ESP_LOGW(TAG, "esp_sleep_enable_gpio_wakeup() that bai: %s",
+                     esp_err_to_name(serr));
         }
     }
 
@@ -184,14 +232,21 @@ void ButtonManager::stop()
 
     // Cut the signal source BEFORE destroying what receives it: after this loop
     // no ISR can reference taskHandle_ any more.
-    for (auto& b : buttons_) {
-        gpio_isr_handler_remove(b.pin());
+    //
+    // The wake source goes with it. Leaving a level trigger armed on a released
+    // button is harmless, but on a button held down at stop() it would keep the
+    // chip out of light sleep forever.
+    for (auto& e : buttons_) {
+        gpio_isr_handler_remove(e.wiring.pin);
+        if (e.wiring.enableWakeup) {
+            gpio_wakeup_disable(e.wiring.pin);
+        }
     }
 
     teardownTask();
 
-    for (auto& b : buttons_) {
-        b.reset();  // stop()/start() must be a clean boundary
+    for (auto& e : buttons_) {
+        e.logic.reset();  // stop()/start() must be a clean boundary
     }
 
     started_ = false;
@@ -299,21 +354,22 @@ bool ButtonManager::pollOnce(uint32_t now)
 {
     bool busy = false;
 
-    for (auto& b : buttons_) {
-        const int  level      = gpio_get_level(b.pin());
-        const bool rawPressed = b.config().activeLow ? (level == 0) : (level != 0);
+    for (auto& e : buttons_) {
+        const int  level      = gpio_get_level(e.wiring.pin);
+        const bool rawPressed = e.wiring.activeLow ? (level == 0) : (level != 0);
 
-        const ButtonEvent ev = b.update(rawPressed, now);
+        const ButtonEvent ev = e.logic.update(rawPressed, now);
         if (ev != ButtonEvent::NONE) {
-            const ButtonEventMsg msg{b.pin(), ev, now, b.pressTimestampMs()};
+            const ButtonEventMsg msg{e.wiring.pin, ev, now,
+                                     e.logic.pressTimestampMs()};
             // Timeout 0: better to drop an event than to block the poll task.
             if (xQueueSend(eventQueue_, &msg, 0) != pdTRUE) {
                 ESP_LOGW(TAG, "queue day, bo su kien %d cua GPIO%d",
-                         static_cast<int>(ev), static_cast<int>(b.pin()));
+                         static_cast<int>(ev), static_cast<int>(e.wiring.pin));
             }
         }
 
-        if (!b.isIdle()) {
+        if (!e.logic.isIdle()) {
             busy = true;
         }
     }

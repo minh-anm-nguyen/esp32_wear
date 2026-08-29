@@ -2,8 +2,8 @@
 
 namespace button {
 
-Button::Button(const ButtonConfig& config, uint8_t debounceMaxCnt)
-    : config_(config),
+Button::Button(const ButtonBehavior& behavior, uint8_t debounceMaxCnt)
+    : behavior_(behavior),
       debounceMaxCnt_(debounceMaxCnt == 0 ? 1 : debounceMaxCnt)
 {
 }
@@ -67,7 +67,7 @@ ButtonEvent Button::update(bool rawPressed, uint32_t nowMs)
             // a double click arrives in WAIT_DOUBLE_CLICK, not here, and emits
             // DOUBLE_CLICK -- already immediate, and the one-event-per-cycle rule
             // means it could not emit both anyway.
-            if (config_.enablePressDown) {
+            if (behavior_.enablePressDown) {
                 ev = ButtonEvent::PRESS_DOWN;
             }
         }
@@ -77,7 +77,7 @@ ButtonEvent Button::update(bool rawPressed, uint32_t nowMs)
         // releasedEdge requires stableState_ == false while the long-press branch
         // requires stableState_ == true, so the two are structurally exclusive.
         if (releasedEdge) {
-            if (config_.enableDoubleClick) {
+            if (behavior_.enableDoubleClick) {
                 fsmState_       = ButtonState::WAIT_DOUBLE_CLICK;
                 clickTimestamp_ = nowMs;
             } else {
@@ -85,7 +85,7 @@ ButtonEvent Button::update(bool rawPressed, uint32_t nowMs)
                 ev        = ButtonEvent::CLICK;
             }
         } else if (stableState_ &&
-                   (nowMs - pressTimestamp_) >= config_.longPressMs) {
+                   (nowMs - pressTimestamp_) >= behavior_.longPressMs) {
             fsmState_ = ButtonState::WAIT_RELEASE_LONG;
             ev        = ButtonEvent::LONG_PRESS;
         }
@@ -98,7 +98,7 @@ ButtonEvent Button::update(bool rawPressed, uint32_t nowMs)
         if (pressedEdge) {
             fsmState_ = ButtonState::WAIT_RELEASE;
             ev        = ButtonEvent::DOUBLE_CLICK;
-        } else if ((nowMs - clickTimestamp_) >= config_.doubleClickMs) {
+        } else if ((nowMs - clickTimestamp_) >= behavior_.doubleClickMs) {
             fsmState_ = ButtonState::IDLE;
             ev        = ButtonEvent::CLICK;
         }

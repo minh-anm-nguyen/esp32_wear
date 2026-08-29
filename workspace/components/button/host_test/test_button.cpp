@@ -52,7 +52,7 @@ static std::string join(const std::vector<ButtonEvent>& v)
 // Simulates one button: feeds a signal described as (duration, level) segments.
 class Sim {
 public:
-    Sim(const ButtonConfig& cfg, uint32_t pollMs, uint32_t startMs = 0)
+    Sim(const ButtonBehavior& cfg, uint32_t pollMs, uint32_t startMs = 0)
         : btn_(cfg, debounceCountFor(cfg.debounceMs, pollMs)),
           poll_(pollMs),
           t_(startMs)
@@ -60,7 +60,7 @@ public:
     }
 
     // Force the debounce cycle count directly, bypassing the debounceMs conversion.
-    Sim(const ButtonConfig& cfg, uint32_t pollMs, uint8_t forcedCnt, uint32_t startMs)
+    Sim(const ButtonBehavior& cfg, uint32_t pollMs, uint8_t forcedCnt, uint32_t startMs)
         : btn_(cfg, forcedCnt), poll_(pollMs), t_(startMs)
     {
     }
@@ -99,10 +99,9 @@ private:
     uint32_t t_;
 };
 
-static ButtonConfig baseCfg()
+static ButtonBehavior baseCfg()
 {
-    ButtonConfig c{};
-    c.pin               = 0;
+    ButtonBehavior c{};
     c.enableDoubleClick = true;
     c.longPressMs       = 800;
     c.doubleClickMs     = 250;
@@ -149,7 +148,7 @@ static void test_long_press()
 
 static void test_chatter_rejected()
 {
-    ButtonConfig c = baseCfg();
+    ButtonBehavior c = baseCfg();
     Sim s(c, 10);            // debounceMs=20, poll=10 -> maxCnt=2
     s.chatter(40);           // level flips every cycle: never 2 consecutive agreeing reads
     s.feed(false, 400);
@@ -159,7 +158,7 @@ static void test_chatter_rejected()
 
 static void test_double_click_disabled()
 {
-    ButtonConfig c   = baseCfg();
+    ButtonBehavior c   = baseCfg();
     c.enableDoubleClick = false;
     Sim s(c, 10);
     s.feed(true, 60);
@@ -289,7 +288,7 @@ static void test_debounce_count_for()
 static void test_tick_rate_independence()
 {
     // Same debounceMs=20 at two tick rates -> same evidence window.
-    ButtonConfig c = baseCfg();
+    ButtonBehavior c = baseCfg();
     EXPECT(debounceCountFor(c.debounceMs, 10) * 10 == 20, "HZ=100: 2 x 10 = 20ms");
     EXPECT(debounceCountFor(c.debounceMs, 5) * 5 == 20,  "HZ=1000: 4 x 5 = 20ms");
 
@@ -313,7 +312,7 @@ static void test_tick_rate_independence()
 
 static void test_debounce_zero_forced_to_one()
 {
-    ButtonConfig c = baseCfg();
+    ButtonBehavior c = baseCfg();
     Sim s(c, 10, /*forcedCnt=*/0, /*startMs=*/0);
     // With maxCnt forced to 1, a pin reporting "released" must yield released.
     s.feed(false, 50);
@@ -324,9 +323,9 @@ static void test_debounce_zero_forced_to_one()
 
 // ------------------------------------------------------- PRESS_DOWN (opt-in)
 
-static ButtonConfig pressDownCfg()
+static ButtonBehavior pressDownCfg()
 {
-    ButtonConfig c      = baseCfg();
+    ButtonBehavior c      = baseCfg();
     c.enablePressDown   = true;
     return c;
 }

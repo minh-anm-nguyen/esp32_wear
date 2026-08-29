@@ -4,6 +4,7 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "soc/clk_tree_defs.h"
 
 namespace buzzer {
 
@@ -29,7 +30,7 @@ BuzzerManager::~BuzzerManager()
 
 // ----------------------------------------------------------------- configuration
 
-esp_err_t BuzzerManager::init(const BuzzerConfig& config)
+esp_err_t BuzzerManager::init(const BuzzerWiring& wiring, const BuzzerSpec& spec)
 {
     if (started_) {
         ESP_LOGE(TAG, "init() khong goi duoc khi dang chay");
@@ -37,30 +38,31 @@ esp_err_t BuzzerManager::init(const BuzzerConfig& config)
     }
 
     // OUTPUT, not merely VALID: an input-only pin can never drive a buzzer.
-    if (!GPIO_IS_VALID_OUTPUT_GPIO(config.pin)) {
+    if (!GPIO_IS_VALID_OUTPUT_GPIO(wiring.pin)) {
         ESP_LOGE(TAG, "GPIO%d khong xuat duoc tin hieu tren chip nay",
-                 static_cast<int>(config.pin));
+                 static_cast<int>(wiring.pin));
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (config.type == BuzzerType::PASSIVE && config.minFreqHz > config.maxFreqHz) {
+    if (spec.type == BuzzerType::PASSIVE && spec.minFreqHz > spec.maxFreqHz) {
         ESP_LOGE(TAG, "minFreqHz=%u > maxFreqHz=%u",
-                 static_cast<unsigned>(config.minFreqHz),
-                 static_cast<unsigned>(config.maxFreqHz));
+                 static_cast<unsigned>(spec.minFreqHz),
+                 static_cast<unsigned>(spec.maxFreqHz));
         return ESP_ERR_INVALID_ARG;
     }
 
-    buzzer_.emplace(config);
+    wiring_ = wiring;
+    buzzer_.emplace(spec);
     return ESP_OK;
 }
 
 esp_err_t BuzzerManager::configureHardware()
 {
-    const BuzzerConfig& dev = buzzer_->config();
+    const BuzzerSpec& spec = buzzer_->spec();
 
-    if (dev.type == BuzzerType::ACTIVE) {
+    if (spec.type == BuzzerType::ACTIVE) {
         gpio_config_t io{};
-        io.pin_bit_mask = 1ULL << static_cast<uint32_t>(dev.pin);
+        io.pin_bit_mask = 1ULL << static_cast<uint32_t>(wiring_.pin);
         io.mode         = GPIO_MODE_OUTPUT;
         io.intr_type    = GPIO_INTR_DISABLE;
 
@@ -69,7 +71,7 @@ esp_err_t BuzzerManager::configureHardware()
             return err;
         }
         // Park the pin before anything can command a tone.
-        return gpio_set_level(dev.pin, dev.activeLow ? 1 : 0);
+        return gpio_set_level(wiring_.pin, wiring_.activeLow ? 1 : 0);
     }
 
     // Park the pad at the silent level BEFORE LEDC takes it over. From reset
@@ -77,7 +79,7 @@ esp_err_t BuzzerManager::configureHardware()
     // resistor on a transistor driver stage can leave the buzzer half on: no
     // sound, but real current and a warm regulator.
     gpio_config_t park{};
-    park.pin_bit_mask = 1ULL << static_cast<uint32_t>(dev.pin);
+    park.pin_bit_mask = 1ULL << static_cast<uint32_t>(wiring_.pin);
     park.mode         = GPIO_MODE_OUTPUT;
     park.intr_type    = GPIO_INTR_DISABLE;
 
@@ -85,7 +87,7 @@ esp_err_t BuzzerManager::configureHardware()
     if (err != ESP_OK) {
         return err;
     }
-    err = gpio_set_level(dev.pin, dev.activeLow ? 1 : 0);
+    err = gpio_set_level(wiring_.pin, wiring_.activeLow ? 1 : 0);
     if (err != ESP_OK) {
         return err;
     }
@@ -94,8 +96,8 @@ esp_err_t BuzzerManager::configureHardware()
     tcfg.speed_mode      = kSpeedMode;
     tcfg.duty_resolution = config_.resolution;
     tcfg.timer_num       = config_.timer;
-    tcfg.freq_hz         = dev.minFreqHz;  // placeholder, every note retunes it
-    tcfg.clk_cfg         = LEDC_AUTO_CLK;
+    tcfg.freq_hz         = spec.minFreqHz;  // placeholder, every note retunes it
+    tcfg.clk_cfg         = config_.clockSource;
 
     err = ledc_timer_config(&tcfg);
     if (err != ESP_OK) {
@@ -103,16 +105,16 @@ esp_err_t BuzzerManager::configureHardware()
     }
 
     ledc_channel_config_t ccfg{};
-    ccfg.gpio_num   = static_cast<int>(dev.pin);
+    ccfg.gpio_num   = static_cast<int>(wiring_.pin);
     ccfg.speed_mode = kSpeedMode;
     ccfg.channel    = config_.channel;
     ccfg.timer_sel  = config_.timer;
     ccfg.duty       = 0;  // silent from the very first instant
     ccfg.hpoint     = 0;
-    ccfg.sleep_mode = LEDC_SLEEP_MODE_NO_ALIVE_NO_PD;
+    ccfg.sleep_mode = config_.sleepMode;
     // Let the peripheral carry the polarity. Everything downstream then works in
     // terms of duty alone, and duty 0 is the silent level for both wirings.
-    ccfg.flags.output_invert = dev.activeLow ? 1u : 0u;
+    ccfg.flags.output_invert = wiring_.activeLow ? 1u : 0u;
 
     return ledc_channel_config(&ccfg);
 }
@@ -129,38 +131,57 @@ esp_err_t BuzzerManager::start()
         return ESP_ERR_INVALID_STATE;
     }
 
-    const BuzzerConfig& dev = buzzer_->config();
+    const BuzzerSpec& spec = buzzer_->spec();
 
     // Reject, never silently correct -- the rule of section 5 of the button
     // design doc. A frequency the resolution cannot express does not fail loudly
     // on its own; it just comes out as the wrong note.
-    if (dev.type == BuzzerType::PASSIVE) {
-        const uint32_t maxFreq = kSrcClkHz >> static_cast<uint32_t>(config_.resolution);
-        if (dev.maxFreqHz > maxFreq) {
+    if (spec.type == BuzzerType::PASSIVE) {
+        const uint32_t maxFreq = srcClkHz() >> static_cast<uint32_t>(config_.resolution);
+        if (spec.maxFreqHz > maxFreq) {
             ESP_LOGE(TAG,
-                     "do phan giai %d bit chi cho toi %" PRIu32 " Hz, ma maxFreqHz=%u. "
+                     "nguon clock %" PRIu32 " Hz voi do phan giai %d bit chi cho toi "
+                     "%" PRIu32 " Hz, ma maxFreqHz=%u. "
                      "Giam Config::resolution hoac giam maxFreqHz.",
-                     static_cast<int>(config_.resolution), maxFreq,
-                     static_cast<unsigned>(dev.maxFreqHz));
+                     srcClkHz(), static_cast<int>(config_.resolution), maxFreq,
+                     static_cast<unsigned>(spec.maxFreqHz));
             return ESP_ERR_INVALID_ARG;
         }
     }
 
     stopRequested_.store(false, std::memory_order_release);
-    muted_ = false;
+    muted_      = false;
+    pmLockHeld_ = false;
     buzzer_->reset();  // do not inherit the state of a previous run
+
+    // Not fatal when it fails. ESP_ERR_NOT_SUPPORTED simply means the build has
+    // no power management, so there is no light sleep to hold off and no DFS to
+    // shift the pitch -- exactly the situation the lock exists to handle.
+    if (pmLock_ == nullptr) {
+        const esp_err_t perr = esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0,
+                                                  "buzzer", &pmLock_);
+        if (perr != ESP_OK) {
+            pmLock_ = nullptr;
+            if (perr != ESP_ERR_NOT_SUPPORTED) {
+                ESP_LOGW(TAG, "esp_pm_lock_create() that bai: %s. Not co the sai "
+                              "cao do hoac bi dut khi he thong ngu.",
+                         esp_err_to_name(perr));
+            }
+        }
+    }
 
     // Hardware FIRST, so the pin is parked silent before the task can exist.
     esp_err_t err = configureHardware();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "cau hinh phan cung GPIO%d that bai: %s",
-                 static_cast<int>(dev.pin), esp_err_to_name(err));
+                 static_cast<int>(wiring_.pin), esp_err_to_name(err));
         return err;
     }
 
     cmdQueue_ = xQueueCreate(config_.queueLength, sizeof(BuzzerCommand));
     if (cmdQueue_ == nullptr) {
         ESP_LOGE(TAG, "khong tao duoc queue");
+        releaseResources();  // the PM lock already exists by now
         idleHardware();
         return ESP_ERR_NO_MEM;
     }
@@ -238,10 +259,15 @@ void BuzzerManager::teardownTask()
         // the queue. Deleting it now would be a use-after-free. A bounded, logged
         // leak is far safer than a crash at an unknown time.
         ESP_LOGE(TAG,
-                 "task khong thoat trong %" PRIu32 " ms: co y ro ri queue + semaphore",
+                 "task khong thoat trong %" PRIu32 " ms: co y ro ri queue + semaphore"
+                 " + pm lock",
                  kStopTimeoutMs);
         cmdQueue_      = nullptr;
         stopSemaphore_ = nullptr;
+        // The task may still be alive and may still acquire or release this
+        // lock. esp_pm_lock_delete() on a held lock is undefined, so leak it
+        // for the same reason as the queue.
+        pmLock_        = nullptr;
 
         // The task normally parks the pin on its way out. It did not get there,
         // and a buzzer left sounding is the one failure the user can hear.
@@ -260,6 +286,63 @@ void BuzzerManager::releaseResources()
         vSemaphoreDelete(stopSemaphore_);
         stopSemaphore_ = nullptr;
     }
+    if (pmLock_ != nullptr) {
+        // Only reached once the task has confirmed it exited, so the lock is
+        // guaranteed released. Deleting a held lock is not allowed.
+        setPmLock(false);
+        esp_pm_lock_delete(pmLock_);
+        pmLock_ = nullptr;
+    }
+}
+
+// --------------------------------------------------------------- power helpers
+
+uint32_t BuzzerManager::srcClkHz() const
+{
+    switch (config_.clockSource) {
+    case LEDC_USE_RC_FAST_CLK:
+        return SOC_CLK_RC_FAST_FREQ_APPROX;  // ~17.5 MHz on the ESP32-S3
+    case LEDC_USE_XTAL_CLK:
+        return static_cast<uint32_t>(CONFIG_XTAL_FREQ) * 1000000u;
+    default:
+        // LEDC_AUTO_CLK and LEDC_USE_APB_CLK. AUTO may in principle pick a
+        // slower source, but it only ever does so for frequencies far below a
+        // buzzer's range, so APB is the right bound for this check.
+        return 80000000u;
+    }
+}
+
+void BuzzerManager::setPmLock(bool want)
+{
+    if (pmLock_ == nullptr || want == pmLockHeld_) {
+        return;
+    }
+    const esp_err_t err = want ? esp_pm_lock_acquire(pmLock_)
+                               : esp_pm_lock_release(pmLock_);
+    if (err == ESP_OK) {
+        pmLockHeld_ = want;
+    } else {
+        // Leave pmLockHeld_ alone so the counts stay balanced; the next note
+        // boundary tries again.
+        ESP_LOGW(TAG, "pm lock %s that bai: %s", want ? "acquire" : "release",
+                 esp_err_to_name(err));
+    }
+}
+
+esp_err_t BuzzerManager::holdPinThroughDeepSleep()
+{
+    if (started_) {
+        // The buzzer task owns this hardware. Two tasks driving one device is
+        // exactly what this codebase refuses to do anywhere else.
+        ESP_LOGE(TAG, "goi stop() truoc khi giu chan cho deep sleep");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!buzzer_.has_value()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    idleHardware();  // park at the silent level before latching it
+    return gpio_hold_en(wiring_.pin);
 }
 
 // ------------------------------------------------------------------- public API
@@ -329,6 +412,18 @@ void BuzzerManager::handleCommand(const BuzzerCommand& cmd)
 void BuzzerManager::run()
 {
     while (!stopRequested_.load(std::memory_order_acquire)) {
+        // Take the PM lock for exactly as long as something is sounding, and
+        // drop it the moment the sequencer goes idle.
+        //
+        // This has to happen HERE, right before the task blocks. The whole note
+        // is spent inside the xQueueReceive() below, and that is precisely the
+        // window in which every other task is also idle and the system would
+        // otherwise slip into light sleep -- stopping the LEDC output halfway
+        // through the note (sleepMode = NO_ALIVE_NO_PD) and shifting APB under
+        // the timer divider (DFS). Holding the lock only while playing keeps
+        // the idle current untouched, which is the point on a watch.
+        setPmLock(!buzzer_->isIdle());
+
         const uint32_t delayMs = buzzer_->nextDelayMs(nowMs());
 
         TickType_t ticks;
@@ -364,6 +459,11 @@ void BuzzerManager::run()
 
     // Park the pin BEFORE signalling: stop() may free the queue the instant the
     // semaphore is given, and a buzzer left sounding is audible forever.
+    //
+    // Drop the PM lock first, and before the semaphore too: releaseResources()
+    // deletes the lock as soon as it sees the semaphore, and deleting a held
+    // lock is not allowed.
+    setPmLock(false);
     idleHardware();
     xSemaphoreGive(stopSemaphore_);
     vTaskDelete(nullptr);
@@ -386,11 +486,10 @@ void BuzzerManager::applyOutput(const ToneOutput& out)
         return;  // hold: retouching LEDC would only add a click
     }
 
-    const BuzzerConfig& dev = buzzer_->config();
-    const bool          on  = out.on && !muted_;
+    const bool on = out.on && !muted_;
 
-    if (dev.type == BuzzerType::ACTIVE) {
-        gpio_set_level(dev.pin, (on != dev.activeLow) ? 1 : 0);
+    if (buzzer_->spec().type == BuzzerType::ACTIVE) {
+        gpio_set_level(wiring_.pin, (on != wiring_.activeLow) ? 1 : 0);
         return;
     }
 
@@ -421,10 +520,8 @@ void BuzzerManager::idleHardware()
     if (!buzzer_.has_value()) {
         return;
     }
-    const BuzzerConfig& dev = buzzer_->config();
-
-    if (dev.type == BuzzerType::ACTIVE) {
-        gpio_set_level(dev.pin, dev.activeLow ? 1 : 0);
+    if (buzzer_->spec().type == BuzzerType::ACTIVE) {
+        gpio_set_level(wiring_.pin, wiring_.activeLow ? 1 : 0);
         return;
     }
 

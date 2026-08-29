@@ -83,10 +83,12 @@ constexpr buzzer::Note kSelfTestNotes[] = {{2000, 1000, 100}};
 //
 // ledc_get_freq() and ledc_get_duty() read the peripheral registers back, so
 // what they print is what the pin is actually doing, not what we asked for.
-void buzzerSelfTest(buzzer::BuzzerManager& buz, const buzzer::BuzzerConfig& cfg)
+void buzzerSelfTest(buzzer::BuzzerManager&      buz,
+                    const buzzer::BuzzerWiring& wiring,
+                    const buzzer::BuzzerSpec&   spec)
 {
     ESP_LOGI(TAG, "--- self test: 1 giay am 2000 Hz tren GPIO%d ---",
-             static_cast<int>(cfg.pin));
+             static_cast<int>(wiring.pin));
 
     const esp_err_t err = buz.play(buzzer::makePattern(kSelfTestNotes, 1, 255));
     if (err != ESP_OK) {
@@ -97,9 +99,9 @@ void buzzerSelfTest(buzzer::BuzzerManager& buz, const buzzer::BuzzerConfig& cfg)
     // Let the buzzer task pick the command up and program LEDC before reading.
     vTaskDelay(pdMS_TO_TICKS(200));
 
-    if (cfg.type == buzzer::BuzzerType::ACTIVE) {
+    if (spec.type == buzzer::BuzzerType::ACTIVE) {
         ESP_LOGI(TAG, "  loai ACTIVE: muc GPIO = %d (mong doi %d)",
-                 gpio_get_level(cfg.pin), cfg.activeLow ? 0 : 1);
+                 gpio_get_level(wiring.pin), wiring.activeLow ? 0 : 1);
     } else {
         const uint32_t freq = ledc_get_freq(LEDC_LOW_SPEED_MODE, LEDC_TIMER_0);
         const uint32_t duty = ledc_get_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
@@ -108,7 +110,7 @@ void buzzerSelfTest(buzzer::BuzzerManager& buz, const buzzer::BuzzerConfig& cfg)
 
         // volume 100 is clamped to maxVolume, and volume maps onto the lower half
         // of the duty range because a piezo is silent at 100% duty.
-        const uint32_t wantDuty = 512u * cfg.maxVolume / 100u;
+        const uint32_t wantDuty = 512u * spec.maxVolume / 100u;
         if (freq == 0 || duty == 0) {
             ESP_LOGE(TAG, "  LEDC KHONG chay -> loi phan mem, khong phai day noi");
         } else if (duty != wantDuty) {
@@ -116,7 +118,7 @@ void buzzerSelfTest(buzzer::BuzzerManager& buz, const buzzer::BuzzerConfig& cfg)
         } else {
             ESP_LOGI(TAG, "  LEDC dung: chan GPIO%d DANG co xung vuong. Neu khong "
                           "nghe thay gi thi van de nam o day noi hoac loa.",
-                     static_cast<int>(cfg.pin));
+                     static_cast<int>(wiring.pin));
         }
     }
 
@@ -135,45 +137,53 @@ extern "C" void app_main(void)
              static_cast<int>(configTICK_RATE_HZ),
              static_cast<int>(portTICK_PERIOD_MS));
 
-    button::ButtonConfig bcfg{};
-    bcfg.pin                = kButtonPin;
-    bcfg.activeLow          = true;   // button wired to GND
-    bcfg.enableInternalPull = true;
-    bcfg.enableDoubleClick  = true;   // on, so all the gesture types show up
-    bcfg.enablePressDown    = true;   // feedback must not wait for doubleClickMs
-    bcfg.longPressMs        = 800;
-    bcfg.doubleClickMs      = 250;
-    bcfg.debounceMs         = 20;     // real time, correct at any tick rate
+    // Wiring and behaviour are separate structs on purpose: the first describes
+    // this board, the second describes how the button should feel. Only the
+    // second one reaches the pure-logic layer.
+    button::ButtonWiring bwire{};
+    bwire.pin                = kButtonPin;
+    bwire.activeLow          = true;   // button wired to GND
+    bwire.enableInternalPull = true;
+    bwire.enableWakeup       = false;  // no light sleep in this demo yet
 
-    buzzer::BuzzerConfig zcfg{};
-    zcfg.pin       = kBuzzerPin;
-    zcfg.type      = buzzer::BuzzerType::PASSIVE;  // ACTIVE for a self-oscillating
-                                                   // buzzer or a vibration motor
-    zcfg.activeLow = false;
-    zcfg.maxVolume = 80;    // a bare piezo driven flat out at 3.3V is painful up close
-    zcfg.minFreqHz = 100;
-    zcfg.maxFreqHz = 10000;
+    button::ButtonBehavior bhow{};
+    bhow.enableDoubleClick = true;   // on, so all the gesture types show up
+    bhow.enablePressDown   = true;   // feedback must not wait for doubleClickMs
+    bhow.longPressMs       = 800;
+    bhow.doubleClickMs     = 250;
+    bhow.debounceMs        = 20;     // real time, correct at any tick rate
 
-    ESP_ERROR_CHECK(btn.addButton(bcfg));
-    ESP_ERROR_CHECK(buz.init(zcfg));
+    buzzer::BuzzerWiring zwire{};
+    zwire.pin       = kBuzzerPin;
+    zwire.activeLow = false;
+
+    buzzer::BuzzerSpec zspec{};
+    zspec.type      = buzzer::BuzzerType::PASSIVE;  // ACTIVE for a self-oscillating
+                                                    // buzzer or a vibration motor
+    zspec.maxVolume = 80;   // a bare piezo driven flat out at 3.3V is painful up close
+    zspec.minFreqHz = 100;
+    zspec.maxFreqHz = 10000;
+
+    ESP_ERROR_CHECK(btn.addButton(bwire, bhow));
+    ESP_ERROR_CHECK(buz.init(zwire, zspec));
 
     // Buzzer first: a button already held down at start() is caught by the very
     // first poll, and the sound path has to exist before that event arrives.
     ESP_ERROR_CHECK(buz.start());
     ESP_ERROR_CHECK(btn.start());
 
-    buzzerSelfTest(buz, zcfg);
+    buzzerSelfTest(buz, zwire, zspec);
 
     ESP_LOGI(TAG, "san sang. Nut GPIO%d, coi GPIO%d",
              static_cast<int>(kButtonPin), static_cast<int>(kBuzzerPin));
     ESP_LOGI(TAG, "  cham xuong   -> bip ngan NGAY (~20ms, chi qua debounce)");
     ESP_LOGI(TAG, "  double click -> hai tieng len giong");
     ESP_LOGI(TAG, "  giu %" PRIu32 "ms   -> bao thuc lap vo han (click luc nay bi bo qua)",
-             bcfg.longPressMs);
+             bhow.longPressMs);
     ESP_LOGI(TAG, "  nha tay      -> tat bao thuc");
     ESP_LOGI(TAG, "luu y: CLICK van bi tre %" PRIu32 " ms vi FSM phai loai tru double "
                   "click; no khong keu, tieng bip da phat luc cham xuong roi",
-             bcfg.doubleClickMs);
+             bhow.doubleClickMs);
 
     button::ButtonEventMsg msg;
     while (btn.waitEvent(msg, UINT32_MAX)) {

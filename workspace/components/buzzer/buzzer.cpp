@@ -2,7 +2,7 @@
 
 namespace buzzer {
 
-Buzzer::Buzzer(const BuzzerConfig& config) : config_(config) {}
+Buzzer::Buzzer(const BuzzerSpec& spec) : spec_(spec) {}
 
 void Buzzer::reset()
 {
@@ -18,7 +18,7 @@ void Buzzer::reset()
 
 uint8_t Buzzer::clampVolume(uint8_t volume) const
 {
-    const uint8_t ceiling = config_.maxVolume > 100 ? 100 : config_.maxVolume;
+    const uint8_t ceiling = spec_.maxVolume > 100 ? 100 : spec_.maxVolume;
     return volume > ceiling ? ceiling : volume;
 }
 
@@ -30,10 +30,10 @@ bool Buzzer::isAudible(uint16_t freqHz) const
     if (freqHz == 0) {
         return false;
     }
-    if (config_.type == BuzzerType::ACTIVE) {
+    if (spec_.type == BuzzerType::ACTIVE) {
         return true;
     }
-    return freqHz >= config_.minFreqHz && freqHz <= config_.maxFreqHz;
+    return freqHz >= spec_.minFreqHz && freqHz <= spec_.maxFreqHz;
 }
 
 void Buzzer::loadNote(uint32_t nowMs)
