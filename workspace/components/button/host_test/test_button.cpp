@@ -1,0 +1,366 @@
+// Tests for the pure logic layer, run on a PC with g++. No chip, no ESP-IDF.
+//   ./run_tests.sh
+#include "button.hpp"
+
+#include <cstdio>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+using namespace button;
+
+// ------------------------------------------------------------ test harness
+
+static int g_checks = 0;
+static int g_failed = 0;
+
+#define EXPECT(cond, ...)                                            \
+    do {                                                             \
+        ++g_checks;                                                  \
+        if (!(cond)) {                                               \
+            ++g_failed;                                              \
+            std::printf("  FAIL  %s:%d  ", __FILE__, __LINE__);      \
+            std::printf(__VA_ARGS__);                                \
+            std::printf("\n");                                       \
+        }                                                            \
+    } while (0)
+
+static const char* name(ButtonEvent e)
+{
+    switch (e) {
+    case ButtonEvent::NONE:               return "NONE";
+    case ButtonEvent::CLICK:              return "CLICK";
+    case ButtonEvent::DOUBLE_CLICK:       return "DOUBLE_CLICK";
+    case ButtonEvent::LONG_PRESS:         return "LONG_PRESS";
+    case ButtonEvent::LONG_PRESS_RELEASE: return "LONG_PRESS_RELEASE";
+    }
+    return "?";
+}
+
+static std::string join(const std::vector<ButtonEvent>& v)
+{
+    if (v.empty()) return "(rong)";
+    std::string s;
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (i) s += " , ";
+        s += name(v[i]);
+    }
+    return s;
+}
+
+// Simulates one button: feeds a signal described as (duration, level) segments.
+class Sim {
+public:
+    Sim(const ButtonConfig& cfg, uint32_t pollMs, uint32_t startMs = 0)
+        : btn_(cfg, debounceCountFor(cfg.debounceMs, pollMs)),
+          poll_(pollMs),
+          t_(startMs)
+    {
+    }
+
+    // Force the debounce cycle count directly, bypassing the debounceMs conversion.
+    Sim(const ButtonConfig& cfg, uint32_t pollMs, uint8_t forcedCnt, uint32_t startMs)
+        : btn_(cfg, forcedCnt), poll_(pollMs), t_(startMs)
+    {
+    }
+
+    void feed(bool level, uint32_t durMs)
+    {
+        for (uint32_t d = 0; d < durMs; d += poll_) {
+            ButtonEvent e = btn_.update(level, t_);
+            if (e != ButtonEvent::NONE) {
+                events.push_back(e);
+                stamps.push_back(t_);
+                pressStamps.push_back(btn_.pressTimestampMs());
+            }
+            t_ += poll_;
+        }
+    }
+
+    // Worst-case chatter: flip the level on every single poll cycle.
+    void chatter(uint32_t cycles)
+    {
+        for (uint32_t i = 0; i < cycles; ++i) {
+            feed(i % 2 == 0, poll_);
+        }
+    }
+
+    Button&  btn() { return btn_; }
+    uint32_t now() const { return t_; }
+
+    std::vector<ButtonEvent> events;
+    std::vector<uint32_t>    stamps;
+    std::vector<uint32_t>    pressStamps;
+
+private:
+    Button   btn_;
+    uint32_t poll_;
+    uint32_t t_;
+};
+
+static ButtonConfig baseCfg()
+{
+    ButtonConfig c{};
+    c.pin               = 0;
+    c.enableDoubleClick = true;
+    c.longPressMs       = 800;
+    c.doubleClickMs     = 250;
+    c.debounceMs        = 20;
+    return c;
+}
+
+static bool seq(const std::vector<ButtonEvent>& got,
+                const std::vector<ButtonEvent>& want)
+{
+    return got == want;
+}
+
+// ------------------------------------------------------------------ test cases
+
+static void test_single_click()
+{
+    Sim s(baseCfg(), 10);
+    s.feed(true, 60);
+    s.feed(false, 400);
+    EXPECT(seq(s.events, {ButtonEvent::CLICK}), "mong CLICK, nhan: %s",
+           join(s.events).c_str());
+}
+
+static void test_double_click()
+{
+    Sim s(baseCfg(), 10);
+    s.feed(true, 60);
+    s.feed(false, 120);
+    s.feed(true, 60);
+    s.feed(false, 300);
+    EXPECT(seq(s.events, {ButtonEvent::DOUBLE_CLICK}),
+           "mong DOUBLE_CLICK don doc, nhan: %s", join(s.events).c_str());
+}
+
+static void test_long_press()
+{
+    Sim s(baseCfg(), 10);
+    s.feed(true, 1000);
+    s.feed(false, 200);
+    EXPECT(seq(s.events, {ButtonEvent::LONG_PRESS, ButtonEvent::LONG_PRESS_RELEASE}),
+           "mong LONG_PRESS + LONG_PRESS_RELEASE, nhan: %s", join(s.events).c_str());
+}
+
+static void test_chatter_rejected()
+{
+    ButtonConfig c = baseCfg();
+    Sim s(c, 10);            // debounceMs=20, poll=10 -> maxCnt=2
+    s.chatter(40);           // level flips every cycle: never 2 consecutive agreeing reads
+    s.feed(false, 400);
+    EXPECT(s.events.empty(), "nhieu lien tuc khong duoc sinh su kien, nhan: %s",
+           join(s.events).c_str());
+}
+
+static void test_double_click_disabled()
+{
+    ButtonConfig c   = baseCfg();
+    c.enableDoubleClick = false;
+    Sim s(c, 10);
+    s.feed(true, 60);
+    s.feed(false, 200);
+    EXPECT(seq(s.events, {ButtonEvent::CLICK}), "mong CLICK ngay khi nha, nhan: %s",
+           join(s.events).c_str());
+    // No waiting window any more, so CLICK must arrive far earlier than with
+    // double click enabled.
+    EXPECT(!s.stamps.empty() && s.stamps[0] < 150,
+           "CLICK phai phat ngay khi nha, timestamp=%u",
+           s.stamps.empty() ? 0u : s.stamps[0]);
+}
+
+static void test_uint32_wrap()
+{
+    Sim s(baseCfg(), 10, /*startMs=*/0xFFFFFF00u);
+    s.feed(true, 60);
+    s.feed(false, 400);
+    EXPECT(seq(s.events, {ButtonEvent::CLICK}),
+           "gan diem tran uint32 van phai ra CLICK, nhan: %s", join(s.events).c_str());
+}
+
+static void test_long_press_wrap()
+{
+    // Press starts before the wrap point, long-press threshold falls after it.
+    Sim s(baseCfg(), 10, /*startMs=*/0xFFFFFF00u);
+    s.feed(true, 1000);
+    s.feed(false, 200);
+    EXPECT(seq(s.events, {ButtonEvent::LONG_PRESS, ButtonEvent::LONG_PRESS_RELEASE}),
+           "long press vat qua diem tran, nhan: %s", join(s.events).c_str());
+}
+
+static void test_double_click_then_hold()
+{
+    Sim s(baseCfg(), 10);
+    s.feed(true, 60);
+    s.feed(false, 120);
+    s.feed(true, 3000);      // hold for 3 seconds after the double click
+    s.feed(false, 200);
+    EXPECT(seq(s.events, {ButtonEvent::DOUBLE_CLICK}),
+           "WAIT_RELEASE phai nuot phan duoi, khong co LONG_PRESS ma. nhan: %s",
+           join(s.events).c_str());
+    EXPECT(s.btn().getState() == ButtonState::IDLE, "phai ve IDLE sau khi nha");
+    EXPECT(s.btn().isIdle(), "isIdle() phai true de manager duoc ngu");
+}
+
+static void test_edge_beats_timeout()
+{
+    // Construct the case where the press edge lands on EXACTLY the cycle at which
+    // the doubleClickMs window expires.
+    // Release at t=60 -> release edge at t=70 -> clickTs=70 -> window ends at t=320.
+    // Drive the signal high from t=310 so the press edge lands exactly on t=320.
+    Sim s(baseCfg(), 10);
+    s.feed(true, 60);
+    s.feed(false, 250);      // t advances to 310
+    s.feed(true, 60);
+    s.feed(false, 300);
+    EXPECT(seq(s.events, {ButtonEvent::DOUBLE_CLICK}),
+           "canh phai thang timeout, nhan: %s", join(s.events).c_str());
+    EXPECT(!s.stamps.empty() && s.stamps[0] == 320,
+           "su kien phai roi dung chu ky t=320, thuc te=%u",
+           s.stamps.empty() ? 0u : s.stamps[0]);
+}
+
+static void test_edge_one_cycle_late()
+{
+    // Exactly one cycle later -> CLICK, then a brand NEW press.
+    Sim s(baseCfg(), 10);
+    s.feed(true, 60);
+    s.feed(false, 260);
+    s.feed(true, 60);
+    s.feed(false, 400);
+    EXPECT(seq(s.events, {ButtonEvent::CLICK, ButtonEvent::CLICK}),
+           "cham mot chu ky -> hai CLICK roi rac, nhan: %s", join(s.events).c_str());
+}
+
+static void test_press_timestamp()
+{
+    {   // CLICK: pressTimestampMs is the press edge, not the emission moment
+        Sim s(baseCfg(), 10);
+        s.feed(true, 60);
+        s.feed(false, 400);
+        EXPECT(s.stamps.size() == 1 && s.pressStamps.size() == 1, "phai co dung 1 su kien");
+        if (s.stamps.size() == 1) {
+            EXPECT(s.stamps[0] == 320, "timestampMs=%u, mong 320", s.stamps[0]);
+            EXPECT(s.pressStamps[0] == 10, "pressTimestampMs=%u, mong 10", s.pressStamps[0]);
+        }
+    }
+    {   // DOUBLE_CLICK: keeps the timestamp of the FIRST press
+        Sim s(baseCfg(), 10);
+        s.feed(true, 60);
+        s.feed(false, 120);
+        s.feed(true, 60);
+        s.feed(false, 300);
+        EXPECT(s.pressStamps.size() == 1 && s.pressStamps[0] == 10,
+               "DOUBLE_CLICK phai giu moc cu nhan thu nhat (10), thuc te=%u",
+               s.pressStamps.empty() ? 0u : s.pressStamps[0]);
+    }
+    {   // LONG_PRESS and LONG_PRESS_RELEASE are one gesture -> same pressTimestampMs
+        Sim s(baseCfg(), 10);
+        s.feed(true, 1000);
+        s.feed(false, 200);
+        EXPECT(s.pressStamps.size() == 2 && s.pressStamps[0] == s.pressStamps[1],
+               "hai su kien cung cu chi phai cung pressTimestampMs");
+    }
+}
+
+static void test_debounce_count_for()
+{
+    EXPECT(debounceCountFor(20, 10) == 2, "(20,10) = %u", debounceCountFor(20, 10));
+    EXPECT(debounceCountFor(20, 5)  == 4, "(20,5)  = %u", debounceCountFor(20, 5));
+    EXPECT(debounceCountFor(20, 30) == 1, "(20,30) = %u", debounceCountFor(20, 30));
+    EXPECT(debounceCountFor(0, 10)  == 1, "(0,10)  = %u", debounceCountFor(0, 10));
+    EXPECT(debounceCountFor(20, 0)  == 1, "(20,0)  = %u", debounceCountFor(20, 0));
+    EXPECT(debounceCountFor(100000, 1) == 255, "phai kep tran o 255, = %u",
+           debounceCountFor(100000, 1));
+
+    // Ceil invariant: cnt*poll >= debounceMs and < debounceMs + poll
+    for (uint32_t d = 1; d <= 60; ++d) {
+        for (uint32_t p = 1; p <= 20; ++p) {
+            uint32_t n = debounceCountFor(d, p);
+            EXPECT(n * p >= d && n * p < d + p, "ceil sai voi (d=%u, p=%u) -> %u", d, p, n);
+        }
+    }
+}
+
+static void test_tick_rate_independence()
+{
+    // Same debounceMs=20 at two tick rates -> same evidence window.
+    ButtonConfig c = baseCfg();
+    EXPECT(debounceCountFor(c.debounceMs, 10) * 10 == 20, "HZ=100: 2 x 10 = 20ms");
+    EXPECT(debounceCountFor(c.debounceMs, 5) * 5 == 20,  "HZ=1000: 4 x 5 = 20ms");
+
+    // Behaviour: a glitch shorter than debounceMs is rejected in BOTH setups.
+    for (uint32_t poll : {10u, 5u}) {
+        Sim s(c, poll);
+        s.feed(true, 10);        // 10ms glitch < 20ms debounceMs
+        s.feed(false, 400);
+        EXPECT(s.events.empty(), "poll=%u: gai 10ms phai bi loai, nhan: %s",
+               poll, join(s.events).c_str());
+    }
+    // And a long enough hold is accepted in BOTH setups.
+    for (uint32_t poll : {10u, 5u}) {
+        Sim s(c, poll);
+        s.feed(true, 60);
+        s.feed(false, 400);
+        EXPECT(seq(s.events, {ButtonEvent::CLICK}), "poll=%u: giu 60ms phai ra CLICK, nhan: %s",
+               poll, join(s.events).c_str());
+    }
+}
+
+static void test_debounce_zero_forced_to_one()
+{
+    ButtonConfig c = baseCfg();
+    Sim s(c, 10, /*forcedCnt=*/0, /*startMs=*/0);
+    // With maxCnt forced to 1, a pin reporting "released" must yield released.
+    s.feed(false, 50);
+    EXPECT(!s.btn().isPressed(),
+           "maxCnt=0 phai bi ep ve 1; neu khong stableState_ ket cung o 'nhan'");
+    EXPECT(s.btn().isIdle(), "phai idle khi khong ai cham vao nut");
+}
+
+static void test_reset()
+{
+    Sim s(baseCfg(), 10);
+    s.feed(true, 1000);          // still held, LONG_PRESS already emitted
+    EXPECT(s.btn().getState() == ButtonState::WAIT_RELEASE_LONG, "phai o WAIT_RELEASE_LONG");
+    s.btn().reset();
+    EXPECT(s.btn().getState() == ButtonState::IDLE, "reset phai ve IDLE");
+    EXPECT(s.btn().isIdle(), "reset phai lam isIdle() true");
+    EXPECT(!s.btn().isPressed(), "reset phai xoa stableState_");
+    EXPECT(s.btn().pressTimestampMs() == 0, "reset phai xoa pressTimestamp_");
+}
+
+// ------------------------------------------------------------------------ main
+
+int main()
+{
+    struct { const char* name; void (*fn)(); } tests[] = {
+        {"nhan ngan -> mot CLICK",                 test_single_click},
+        {"nhan hai lan -> DOUBLE_CLICK",           test_double_click},
+        {"giu lau -> LONG_PRESS + RELEASE",        test_long_press},
+        {"nhieu lien tuc -> khong su kien",        test_chatter_rejected},
+        {"tat double click -> CLICK ngay",         test_double_click_disabled},
+        {"nowMs gan diem tran uint32",             test_uint32_wrap},
+        {"long press vat qua diem tran",           test_long_press_wrap},
+        {"double click roi giu 3 giay",            test_double_click_then_hold},
+        {"canh thang timeout cung chu ky",         test_edge_beats_timeout},
+        {"cham mot chu ky -> hai CLICK",           test_edge_one_cycle_late},
+        {"pressTimestampMs",                       test_press_timestamp},
+        {"debounceCountFor()",                     test_debounce_count_for},
+        {"doc lap tick rate",                      test_tick_rate_independence},
+        {"debounceMaxCnt = 0 bi ep ve 1",          test_debounce_zero_forced_to_one},
+        {"reset()",                                test_reset},
+    };
+
+    std::printf("=== test Button (logic thuan) ===\n");
+    for (auto& t : tests) {
+        int before = g_failed;
+        t.fn();
+        std::printf("  [%s] %s\n", g_failed == before ? "OK  " : "FAIL", t.name);
+    }
+    std::printf("--- %d kiem tra, %d that bai ---\n", g_checks, g_failed);
+    return g_failed == 0 ? 0 : 1;
+}
