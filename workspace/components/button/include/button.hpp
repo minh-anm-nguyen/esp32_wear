@@ -27,6 +27,7 @@ enum class ButtonState : uint8_t {
 
 enum class ButtonEvent : uint8_t {
     NONE,
+    PRESS_DOWN,  // the debounced press edge itself, before any gesture is known
     CLICK,
     DOUBLE_CLICK,
     LONG_PRESS,
@@ -38,6 +39,18 @@ struct ButtonConfig {
     bool       activeLow{true};
     bool       enableInternalPull{true};
     bool       enableDoubleClick{true};
+
+    // Off by default, because turning it on inserts an extra event in front of
+    // every gesture and would change the sequence an existing app receives.
+    //
+    // Turn it on when something must react at the instant of the press -- a
+    // feedback beep, a haptic tick, a screen waking up. Those cannot wait for
+    // CLICK: with enableDoubleClick on, CLICK is held back by doubleClickMs
+    // while the FSM rules out a second press (§9.2), which is a delay a finger
+    // can feel. PRESS_DOWN reports the pin, not a gesture, so nothing is pending
+    // and it goes out as soon as the debounce integrator settles.
+    bool       enablePressDown{false};
+
     uint32_t   longPressMs{800};
     uint32_t   doubleClickMs{250};
     uint32_t   debounceMs{20};   // real time; the cycle count is derived from it

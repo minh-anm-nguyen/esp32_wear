@@ -29,6 +29,7 @@ static const char* name(ButtonEvent e)
 {
     switch (e) {
     case ButtonEvent::NONE:               return "NONE";
+    case ButtonEvent::PRESS_DOWN:         return "PRESS_DOWN";
     case ButtonEvent::CLICK:              return "CLICK";
     case ButtonEvent::DOUBLE_CLICK:       return "DOUBLE_CLICK";
     case ButtonEvent::LONG_PRESS:         return "LONG_PRESS";
@@ -321,6 +322,92 @@ static void test_debounce_zero_forced_to_one()
     EXPECT(s.btn().isIdle(), "phai idle khi khong ai cham vao nut");
 }
 
+// ------------------------------------------------------- PRESS_DOWN (opt-in)
+
+static ButtonConfig pressDownCfg()
+{
+    ButtonConfig c      = baseCfg();
+    c.enablePressDown   = true;
+    return c;
+}
+
+static void test_press_down_off_by_default()
+{
+    EXPECT(!baseCfg().enablePressDown, "enablePressDown phai mac dinh tat");
+
+    Sim s(baseCfg(), 10);
+    s.feed(true, 60);
+    s.feed(false, 400);
+    EXPECT(seq(s.events, {ButtonEvent::CLICK}),
+           "mac dinh tat thi chuoi su kien phai y nguyen nhu cu, nhan: %s",
+           join(s.events).c_str());
+}
+
+static void test_press_down_emitted()
+{
+    Sim s(pressDownCfg(), 10);
+    s.feed(true, 60);
+    s.feed(false, 400);
+    EXPECT(seq(s.events, {ButtonEvent::PRESS_DOWN, ButtonEvent::CLICK}),
+           "mong PRESS_DOWN roi CLICK, nhan: %s", join(s.events).c_str());
+}
+
+// The whole point of the event: it must land while the finger is still down,
+// not after doubleClickMs has expired.
+static void test_press_down_is_immediate()
+{
+    Sim s(pressDownCfg(), 10);
+    s.feed(true, 60);
+    s.feed(false, 400);
+
+    EXPECT(s.stamps.size() == 2, "phai co dung 2 su kien, nhan %zu", s.stamps.size());
+    if (s.stamps.size() == 2) {
+        // debounceMs=20 at a 10ms poll is 2 cycles, so the edge settles at t=10.
+        EXPECT(s.stamps[0] <= 20,
+               "PRESS_DOWN phai phat ngay sau debounce, nhan t=%u", s.stamps[0]);
+        // CLICK still pays the full double click window; that is the delay the
+        // press-down event exists to hide.
+        EXPECT(s.stamps[1] - s.stamps[0] >= 250,
+               "CLICK van phai cho het cua so, chenh lech=%u",
+               s.stamps[1] - s.stamps[0]);
+    }
+}
+
+static void test_press_down_once_per_double_click()
+{
+    Sim s(pressDownCfg(), 10);
+    s.feed(true, 60);
+    s.feed(false, 120);
+    s.feed(true, 60);
+    s.feed(false, 300);
+    // The second press starts from WAIT_DOUBLE_CLICK, so it yields DOUBLE_CLICK
+    // and NOT a second PRESS_DOWN.
+    EXPECT(seq(s.events, {ButtonEvent::PRESS_DOWN, ButtonEvent::DOUBLE_CLICK}),
+           "chi mot PRESS_DOWN cho ca cu chi double click, nhan: %s",
+           join(s.events).c_str());
+}
+
+static void test_press_down_long_press()
+{
+    Sim s(pressDownCfg(), 10);
+    s.feed(true, 1000);
+    s.feed(false, 200);
+    EXPECT(seq(s.events, {ButtonEvent::PRESS_DOWN, ButtonEvent::LONG_PRESS,
+                          ButtonEvent::LONG_PRESS_RELEASE}),
+           "mong PRESS_DOWN + LONG_PRESS + RELEASE, nhan: %s", join(s.events).c_str());
+}
+
+// PRESS_DOWN sits behind the debounce integrator like every other event, so it
+// must not turn contact bounce into a burst of beeps.
+static void test_press_down_still_debounced()
+{
+    Sim s(pressDownCfg(), 10);
+    s.chatter(40);
+    s.feed(false, 400);
+    EXPECT(s.events.empty(), "nhieu lien tuc van khong duoc sinh PRESS_DOWN, nhan: %s",
+           join(s.events).c_str());
+}
+
 static void test_reset()
 {
     Sim s(baseCfg(), 10);
@@ -352,6 +439,12 @@ int main()
         {"debounceCountFor()",                     test_debounce_count_for},
         {"doc lap tick rate",                      test_tick_rate_independence},
         {"debounceMaxCnt = 0 bi ep ve 1",          test_debounce_zero_forced_to_one},
+        {"PRESS_DOWN mac dinh tat",                test_press_down_off_by_default},
+        {"PRESS_DOWN bat -> PRESS_DOWN + CLICK",   test_press_down_emitted},
+        {"PRESS_DOWN phat ngay, khong cho",        test_press_down_is_immediate},
+        {"double click chi mot PRESS_DOWN",        test_press_down_once_per_double_click},
+        {"PRESS_DOWN + LONG_PRESS + RELEASE",      test_press_down_long_press},
+        {"PRESS_DOWN van bi debounce",             test_press_down_still_debounced},
         {"reset()",                                test_reset},
     };
 

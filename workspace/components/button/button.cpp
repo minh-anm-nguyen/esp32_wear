@@ -60,6 +60,16 @@ ButtonEvent Button::update(bool rawPressed, uint32_t nowMs)
         if (pressedEdge) {
             fsmState_       = ButtonState::PRESSED;
             pressTimestamp_ = nowMs;
+            // The only event that reports the PIN rather than a gesture, which
+            // is exactly why it needs no waiting: nothing is left to disambiguate.
+            //
+            // This branch is the sole source of PRESS_DOWN. The second press of
+            // a double click arrives in WAIT_DOUBLE_CLICK, not here, and emits
+            // DOUBLE_CLICK -- already immediate, and the one-event-per-cycle rule
+            // means it could not emit both anyway.
+            if (config_.enablePressDown) {
+                ev = ButtonEvent::PRESS_DOWN;
+            }
         }
         break;
 
