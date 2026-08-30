@@ -18,6 +18,9 @@
 // whenever no note is playing or the transistor keeps conducting.
 #include "button_manager.hpp"
 #include "buzzer_manager.hpp"
+#include "i2c_device.hpp"
+#include "imu_manager.hpp"
+#include "motion_controller.hpp"
 
 #include <cinttypes>
 
@@ -31,6 +34,10 @@ namespace {
 constexpr const char* TAG = "app";
 
 constexpr gpio_num_t kButtonPin = GPIO_NUM_0;
+constexpr gpio_num_t kI2cSda    = GPIO_NUM_11;  // dung chung: cam ung + RTC + IMU
+constexpr gpio_num_t kI2cScl    = GPIO_NUM_10;
+constexpr gpio_num_t kImuInt    = GPIO_NUM_38;  // QMI_INT2 (INT1 khong ra chan)
+constexpr uint16_t   kImuAddr   = 0x6B;
 constexpr gpio_num_t kBuzzerPin = GPIO_NUM_42;  // GPIO_NUM_33 on the older revision
 
 const char* eventName(button::ButtonEvent e)
@@ -50,6 +57,35 @@ const char* eventName(button::ButtonEvent e)
 // components: neither one references the other, the application joins them.
 // Returning a pointer into flash is safe -- the stock patterns are constexpr,
 // so they outlive any playback (see the lifetime note on buzzer::Pattern).
+// Gesture -> sound, decided by the APPLICATION. components/motion has never
+// heard of a buzzer and components/imu has never heard of MotionController;
+// this callback is the only place all three meet. Same arrangement that
+// already joins the button to the buzzer below.
+void onMotionEvent(void* ctx, motion::MotionEvent ev, uint32_t nowMs)
+{
+    auto* buz = static_cast<buzzer::BuzzerManager*>(ctx);
+    if (ev == motion::MotionEvent::WRIST_RAISE) {
+        ESP_LOGI(TAG, "NANG CO TAY (t=%" PRIu32 " ms) -> bat man hinh", nowMs);
+        buz->play(buzzer::patterns::kClick);
+    } else if (ev == motion::MotionEvent::WRIST_LOWER) {
+        ESP_LOGI(TAG, "ha tay (t=%" PRIu32 " ms) -> tat man hinh", nowMs);
+    }
+}
+
+const char* imuEventName(imu::ImuEventMsg::Type t)
+{
+    switch (t) {
+    case imu::ImuEventMsg::Type::WAKE_ON_MOTION: return "WAKE_ON_MOTION";
+    case imu::ImuEventMsg::Type::STEP:           return "STEP";
+    case imu::ImuEventMsg::Type::TAP:            return "TAP";
+    case imu::ImuEventMsg::Type::ANY_MOTION:     return "ANY_MOTION";
+    case imu::ImuEventMsg::Type::NO_MOTION:      return "NO_MOTION";
+    case imu::ImuEventMsg::Type::SIG_MOTION:     return "SIG_MOTION";
+    case imu::ImuEventMsg::Type::BUS_ERROR:      return "BUS_ERROR";
+    }
+    return "?";
+}
+
 const buzzer::Pattern* soundFor(button::ButtonEvent e)
 {
     switch (e) {
@@ -129,8 +165,25 @@ void buzzerSelfTest(buzzer::BuzzerManager&      buz,
 
 extern "C" void app_main(void)
 {
+    // Sampled FIRST, before anything reconfigures the pad. GPIO0 is a
+    // strapping pin and comes out of reset as an input with a pull-up, so
+    // "held down at boot" reads as LOW without any setup. That gives an
+    // entry gesture for calibration with no UI at all.
+    const bool calibrationRequested = (gpio_get_level(kButtonPin) == 0);
+
+    // The GPIO ISR service is a system-wide singleton, and calling
+    // gpio_install_isr_service() twice makes IDF log an ERROR even though the
+    // second caller handles the return value fine. Install it ONCE here, then
+    // tell both managers not to try -- which also stops the flags being an
+    // accident of whichever component happens to start first.
+    ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_install_isr_service(0));
+
     // pollIntervalMs derives itself from the tick rate: 10ms at HZ=100, 5ms at HZ=1000.
-    static button::ButtonManager btn;
+    static button::ButtonManager btn{[] {
+        button::ButtonManager::Config c{};
+        c.installIsrService = false;  // app_main owns it
+        return c;
+    }()};
     static buzzer::BuzzerManager buz;
 
     ESP_LOGI(TAG, "tick rate = %d Hz, 1 tick = %d ms",
@@ -164,15 +217,113 @@ extern "C" void app_main(void)
     zspec.minFreqHz = 100;
     zspec.maxFreqHz = 10000;
 
-    ESP_ERROR_CHECK(btn.addButton(bwire, bhow));
+    // Sound comes up FIRST, before the I2C section. Axis calibration can sit
+    // there for half a minute waiting to be told the watch is still, and a
+    // wrist raise during that window should still be audible.
     ESP_ERROR_CHECK(buz.init(zwire, zspec));
-
-    // Buzzer first: a button already held down at start() is caught by the very
-    // first poll, and the sound path has to exist before that event arrives.
     ESP_ERROR_CHECK(buz.start());
-    ESP_ERROR_CHECK(btn.start());
-
     buzzerSelfTest(buz, zwire, zspec);
+
+    // The bus has exactly one owner, created here and handed to every driver
+    // by reference. Nobody else calls i2c_new_master_bus().
+    // See doc-design/i2c-bus-design.md section 2.
+    static i2c::BusManager  i2cBus;
+    i2c::BusManager::Config i2cCfg{};
+    i2cCfg.sda = kI2cSda;
+    i2cCfg.scl = kI2cScl;
+    // NOT ESP_ERROR_CHECK. That aborts, the chip reboots, and the whole thing
+    // becomes an endless boot loop in which the one error message scrolls past
+    // too fast to read -- while the buzzer replays its self-test tone on every
+    // cycle. A watch that cannot reach its IMU should still be a watch.
+    const bool i2cReady = (i2cBus.init(i2cCfg) == ESP_OK);
+    if (!i2cReady) {
+        ESP_LOGE(TAG, "khong mo duoc bus I2C -- bo qua IMU, nut va coi van chay");
+    }
+
+    // Self-proving bring-up: the firmware asks the bus who is out there and
+    // says so, naming what is MISSING as loudly as what is present. No meter,
+    // no scope -- same idea as buzzerSelfTest() above.
+    if (i2cReady) {
+        i2cBus.logScan(TAG);
+    }
+
+    // The IMU borrows a Device the application owns. Static storage: the
+    // Device must outlive every driver holding a reference to it.
+    static i2c::Device imuDev;
+    static imu::ImuManager imuMgr;
+    if (i2cReady && i2cBus.createDevice(kImuAddr, 400000, imuDev) == ESP_OK) {
+        // The IMU pushes samples at whatever implements sensors::ISampleSink.
+        // It never learns that this one recognises wrist raises.
+        static motion::MotionController wrist;
+        wrist.setEventCallback(onMotionEvent, &buz);
+
+        imu::ImuManager::Config icfg{};
+        icfg.bus    = &imuDev;
+        icfg.intPin = kImuInt;
+        icfg.sink   = &wrist;
+        icfg.installIsrService = false;  // app_main owns it
+        // The chip is glued with its Z axis pointing INTO the screen, so the
+        // sign has to be flipped. Measured on the bench, not guessed: with the
+        // identity remap, laying the board glass-up reported a LOWER and
+        // PCB-up reported a RAISE -- exactly backwards.
+        //
+        // The convention this restores (motion_controller.hpp): +Z points OUT
+        // of the screen. Worn on a wrist with the glass facing outward, an arm
+        // hanging by the side puts the screen normal roughly horizontal (~90
+        // degrees, above downThresholdDeg = 65 -> screen off), and raising the
+        // arm to read the time brings it to ~20-40 degrees (below
+        // viewThresholdDeg = 35 -> screen on).
+        //
+        // X and Y are still identity. They do not affect wrist raise, which
+        // only uses the Z component and the magnitude -- but screen rotation
+        // will need them, so run the full calibration (hold BOOT at power-up)
+        // before building that.
+        //
+        // Left at identity while calibrating: runAxisCalibration() can only
+        // derive a mapping from SENSOR-frame readings, and latest() hands back
+        // samples that have already been through the remap.
+        if (!calibrationRequested) {
+            icfg.remap.sign[2] = -1;
+        }
+
+        if (imuMgr.init(icfg) == ESP_OK && imuMgr.start() == ESP_OK) {
+            imu::SelfTestResult st{};
+            imuMgr.runSelfTest(st);   // logs one PASS/FAIL line per check
+
+            // Stay in ACTIVITY so samples keep flowing to the wrist FSM.
+            // WOM would be the real watch idle state, but it produces no
+            // sample stream to demonstrate with.
+            imuMgr.setPowerMode(imu::PowerMode::ACTIVITY);
+
+            if (calibrationRequested) {
+                // The remap cannot be guessed: nobody knows which way the
+                // chip was glued until the board says so. Until this has
+                // been run once and its output pasted below, the tilt
+                // angles are computed on the wrong axes and a wrist raise
+                // may simply never register.
+                imu::AxisRemap measured{};
+                if (imu::runAxisCalibration(imuMgr, measured) == ESP_OK) {
+                    ESP_LOGI(TAG, "dan ket qua tren vao icfg.remap roi nap lai");
+                }
+            } else {
+                ESP_LOGI(TAG, "giu nut BOOT luc khoi dong de hieu chuan truc");
+            }
+
+            ESP_LOGI(TAG, "nang co tay len ngang mat -> se keu mot tieng bip");
+        } else {
+            ESP_LOGE(TAG, "IMU khong khoi tao duoc");
+        }
+    } else {
+        if (i2cReady) {
+            ESP_LOGE(TAG, "khong tao duoc thiet bi I2C 0x%02X", kImuAddr);
+        }
+    }
+
+    // Buttons last: a button already held down at start() is caught by the
+    // very first poll, and everything that reacts to it -- the buzzer, the
+    // calibration gesture -- must already exist by then.
+    ESP_ERROR_CHECK(btn.addButton(bwire, bhow));
+    ESP_ERROR_CHECK(btn.start());
 
     ESP_LOGI(TAG, "san sang. Nut GPIO%d, coi GPIO%d",
              static_cast<int>(kButtonPin), static_cast<int>(kBuzzerPin));
@@ -185,8 +336,20 @@ extern "C" void app_main(void)
                   "click; no khong keu, tieng bip da phat luc cham xuong roi",
              bhow.doubleClickMs);
 
+    // Drain BOTH queues. Waiting forever on the button one left the IMU queue
+    // to fill up and start dropping events -- which is exactly what the
+    // "queue day, bo su kien 0" warnings were saying.
     button::ButtonEventMsg msg;
-    while (btn.waitEvent(msg, UINT32_MAX)) {
+    for (;;) {
+        imu::ImuEventMsg iev;
+        while (imuMgr.waitEvent(iev, 0)) {
+            ESP_LOGI(TAG, "IMU  %-15s  t=%" PRIu32 " ms", imuEventName(iev.type),
+                     iev.timestampMs);
+        }
+
+        if (!btn.waitEvent(msg, 100)) {
+            continue;  // just a timeout: go back and check the IMU queue
+        }
         // timestampMs      = when the FSM reached its conclusion
         // pressTimestampMs = when the user started pressing
         // The difference between them is the latency of that event type.
@@ -213,5 +376,5 @@ extern "C" void app_main(void)
         }
     }
 
-    ESP_LOGE(TAG, "waitEvent() that bai - queue khong con");
+    // unreachable: the loop above never exits
 }

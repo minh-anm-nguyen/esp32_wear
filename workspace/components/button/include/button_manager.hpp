@@ -127,6 +127,12 @@ public:
         // flash write. Adding it obliges EVERY handler on the shared service to
         // be IRAM-safe.
         int         isrFlags{0};
+
+        // False when app_main has already installed the service. Calling
+        // gpio_install_isr_service() a second time makes IDF log an ERROR before
+        // it returns ESP_ERR_INVALID_STATE, so tolerating the return value is not
+        // enough to keep the log clean.
+        bool        installIsrService{true};
     };
 
     // Two separate constructors instead of one with a '= {}' default argument:

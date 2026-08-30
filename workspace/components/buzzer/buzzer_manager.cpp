@@ -4,6 +4,7 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_private/esp_gpio_reserve.h"
 #include "soc/clk_tree_defs.h"
 
 namespace buzzer {
@@ -91,6 +92,14 @@ esp_err_t BuzzerManager::configureHardware()
     if (err != ESP_OK) {
         return err;
     }
+
+    // gpio_config() with GPIO_MODE_OUTPUT RESERVES the pad. ledc_channel_config()
+    // then reserves it too, finds it taken, and warns "GPIO n is not usable,
+    // maybe conflict with others" -- a conflict with nobody but ourselves.
+    //
+    // LEDC still works, so this is only noise. But it is noise that would hide
+    // a genuine conflict later, so hand the pad back before LEDC asks for it.
+    esp_gpio_revoke(BIT64(wiring_.pin));
 
     ledc_timer_config_t tcfg{};
     tcfg.speed_mode      = kSpeedMode;

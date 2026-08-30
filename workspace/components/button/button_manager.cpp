@@ -160,9 +160,15 @@ esp_err_t ButtonManager::start()
     // installed it already is not an error -- and in that case config_.isrFlags
     // is silently ignored, because the first caller's flags are the ones that
     // took effect. See the comment on Config::isrFlags.
-    esp_err_t err = gpio_install_isr_service(config_.isrFlags);
+    esp_err_t err = ESP_OK;
+    if (config_.installIsrService) {
+        err = gpio_install_isr_service(config_.isrFlags);
+    } else {
+        err = ESP_ERR_INVALID_STATE;  // app_main owns it; take the shared path
+    }
     if (err == ESP_ERR_INVALID_STATE) {
         isrServiceOwned_ = false;
+        err              = ESP_OK;
     } else if (err != ESP_OK) {
         ESP_LOGE(TAG, "gpio_install_isr_service() that bai: %s", esp_err_to_name(err));
         teardownTask();
