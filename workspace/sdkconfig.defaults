@@ -1,0 +1,53 @@
+# Project-wide build configuration -- THIS is the version-controlled one.
+#
+# WHY THIS FILE EXISTS
+#
+# .gitignore excludes sdkconfig, and idf.py regenerates it. So every decision
+# recorded in doc-design/ that happens to live in sdkconfig would quietly vanish
+# on the next `idf.py fullclean` or the next clone, leaving the documents
+# describing a configuration the repository cannot reproduce.
+#
+# sdkconfig is the generated artefact. This file is the source of the decisions.
+#
+# Only DELIBERATE choices belong here. Anything left at the IDF default should
+# stay unlisted, so this reads as a list of decisions rather than a snapshot.
+# Each entry cites the section that argued for it.
+
+# --- FreeRTOS tick: 100 Hz -> 1000 Hz ---------------------------------------
+# doc-design/display.md section 4.1.
+#
+# At 100 Hz a tick is 10 ms while a 40-line flush takes 3.84 ms, so the wake-up
+# latency of the DMA completion handshake was nearly three times the transfer
+# itself. Six to seven flushes per frame, one tick lost to each, put the ceiling
+# near 15 fps -- a limit with nothing whatever to do with the 40 MHz SPI clock.
+#
+# Global: it also changes the polling cadence of components/button and
+# components/imu, both of which express their timing in real milliseconds and
+# therefore only get more accurate.
+CONFIG_FREERTOS_HZ=1000
+
+# --- Flash: 2 MB -> 16 MB ---------------------------------------------------
+# The module carries 16 MB but the image header claimed 2 MB, which the
+# bootloader reported on every single boot:
+#
+#   W (250) spi_flash: Detected size(16384k) larger than the size in the binary
+#   image header(2048k). Using the size in the binary image header.
+#
+# Not cosmetic for this project: LVGL fonts and images live in flash and are
+# executed in place -- see section 4.3 on why they must NOT be copied into
+# PSRAM -- so the other 14 MB is precisely the storage the UI phase needs.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# --- PSRAM: deliberately OFF ------------------------------------------------
+# doc-design/display.md section 4.3.
+#
+# Listed even though "off" is the default, because this is a decision somebody
+# could reasonably flip by reflex. Font and image data is const, lives in flash
+# and executes in place; copying it into PSRAM trades bandwidth for something
+# that was already free. Revisit only with a measurement in hand.
+CONFIG_SPIRAM=n
+
+# --- CPU 160 MHz ------------------------------------------------------------
+# Already the IDF default on the ESP32-S3, pinned because the SPI bandwidth
+# budget in display.md section 3.1 is computed against it.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y

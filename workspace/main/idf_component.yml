@@ -1,0 +1,29 @@
+## IDF Component Manager manifest for the application.
+##
+## doc-design/display.md section 4.2.
+##
+## LVGL 8 and LVGL 9 are not source compatible -- the flush handshake alone
+## renamed lv_disp_flush_ready() to lv_display_flush_ready(), and every screen
+## built against one fails to compile against the other. The whole `ui` phase is
+## written against 9, so the major version has to be nailed down before a line
+## of UI exists rather than discovered when a rebuild silently pulls 10.
+##
+## HOW THE PIN ACTUALLY WORKS, because it is two files and not one:
+##
+##   this manifest   states the ACCEPTABLE RANGE   -> ~9.5.0 = >=9.5.0, <9.6.0
+##   dependencies.lock  records the EXACT BUILD    -> 9.5.0 + its content hash
+##
+## dependencies.lock is committed, so a fresh clone reproduces this exact LVGL.
+## managed_components/ is gitignored on purpose: it is the downloaded source,
+## rebuildable from the lock at any time.
+##
+## The range is `~` rather than `==` deliberately. Pinning the patch level too
+## would refuse upstream bug fixes for no benefit, while `~` still forbids the
+## 9.6 API drift the paragraph above is actually worried about. The lock file is
+## what makes builds reproducible; the range is what makes updates deliberate.
+dependencies:
+  idf:
+    version: '>=5.3'
+
+  lvgl/lvgl:
+    version: '~9.5.0'
