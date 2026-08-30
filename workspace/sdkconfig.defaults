@@ -51,3 +51,77 @@ CONFIG_SPIRAM=n
 # Already the IDF default on the ESP32-S3, pinned because the SPI bandwidth
 # budget in display.md section 3.1 is computed against it.
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
+
+# --- LVGL ------------------------------------------------------------------
+# doc-design/ui.md section 4.
+#
+# WHY THESE ARE LISTED WHEN THEY ARE ALL AT THEIR DEFAULT
+#
+# The rule at the top of this file says defaults stay unlisted. These are the
+# documented exception, for the same reason CONFIG_SPIRAM=n is: they are not
+# ESP-IDF defaults, they are LVGL COMPONENT defaults, and main/idf_component.yml
+# accepts any 9.5.x. A patch release is allowed to move a Kconfig default, and
+# every symbol below is one where that would silently change the UI's memory,
+# threading or refresh contract with no compile error anywhere.
+#
+# LVGL is configured through Kconfig here, NOT through an lv_conf.h --
+# CONFIG_LV_CONF_SKIP=y is what selects that. Do not add an lv_conf.h copied
+# from an LVGL 8 example: with two config sources a macro can end up defined
+# somewhere other than where it is being read.
+CONFIG_LV_CONF_SKIP=y
+
+# RGB565, matching display::Config::dataEndian and bits_per_pixel = 16.
+# Anything else and the flush buffer arithmetic in display.md section 9.1 is
+# wrong by a whole factor.
+CONFIG_LV_COLOR_DEPTH_16=y
+
+# NO OS INTEGRATION -- and this is a load-bearing decision, not an omission.
+#
+# LV_OS_NONE makes lv_lock()/lv_unlock() no-ops. That is correct here because
+# exactly one task ever touches LVGL (display.md section 2, ui.md section 9),
+# so the lock would guard nothing and cost every call.
+#
+# The consequence is that there is NO safety net: a stray LVGL call from the
+# IMU or touch task will not deadlock and will not assert, it will corrupt the
+# object tree and surface later as a random reboot. Switching this to
+# LV_OS_FREERTOS does not make that safe either -- it would only relocate the
+# rule. The rule is the single UI task; keep it.
+CONFIG_LV_OS_NONE=y
+
+# LVGL's own allocator, out of internal SRAM (PSRAM is off). 64 KB on top of
+# the 38.4 KB of flush buffers, out of 512 KB total.
+#
+# A starting point, not a measurement: lv_mem_monitor() after the heaviest
+# screen decides the final number. Raise it and screens stop failing to build
+# themselves; lower it and the rest of the firmware breathes. Either way the
+# value has to be HERE, because a screen that just fits at 64 KB and a screen
+# that just fits at 48 KB are not the same product.
+CONFIG_LV_MEM_SIZE_KILOBYTES=64
+
+# 33 ms = 30 Hz refresh period. Sits deliberately under the ~37 fps SPI ceiling
+# computed in display.md section 3.1: asking LVGL to refresh faster than the bus
+# can deliver only queues work that arrives late.
+CONFIG_LV_DEF_REFR_PERIOD=33
+
+# 4-byte alignment, which is what SPI DMA on the ESP32-S3 needs and what
+# heap_caps_malloc(MALLOC_CAP_DMA) already returns. Pinned so the two cannot
+# drift apart.
+CONFIG_LV_DRAW_BUF_ALIGN=4
+
+# Asserts: null and malloc ON, the expensive ones off.
+#
+# LV_USE_ASSERT_MALLOC is the one that matters right now -- with a fixed 64 KB
+# pool, an allocation failure otherwise returns NULL and gets dereferenced three
+# frames later somewhere unrelated.
+#
+# LV_USE_ASSERT_OBJ and LV_USE_ASSERT_MEM_INTEGRITY are the bring-up profile,
+# not the default: turn them on while chasing a use-after-free on an lv_obj_t
+# (ui.md section 4.5), measure, turn them back off.
+CONFIG_LV_USE_ASSERT_NULL=y
+CONFIG_LV_USE_ASSERT_MALLOC=y
+
+# LVGL's internal logging, off. It routes through printf, not ESP_LOG, and the
+# flush and input paths are exactly where an un-rate-limited log destroys the
+# frame timing it is supposed to help measure. Turn on together with
+# CONFIG_LV_LOG_LEVEL when a bring-up step is actually silent about a failure.
+CONFIG_LV_USE_LOG=n

@@ -23,6 +23,7 @@
 #include "i2c_device.hpp"
 #include "imu_manager.hpp"
 #include "motion_controller.hpp"
+#include "touch_manager.hpp"
 
 #include <cinttypes>
 
@@ -40,6 +41,7 @@ constexpr gpio_num_t kI2cSda    = GPIO_NUM_11;  // dung chung: cam ung + RTC + I
 constexpr gpio_num_t kI2cScl    = GPIO_NUM_10;
 constexpr gpio_num_t kImuInt    = GPIO_NUM_38;  // QMI_INT2 (INT1 khong ra chan)
 constexpr uint16_t   kImuAddr   = 0x6B;
+constexpr uint16_t   kTouchAddr = 0x15;         // CST816T, RST=GPIO13, INT=GPIO14
 constexpr gpio_num_t kBuzzerPin = GPIO_NUM_42;  // GPIO_NUM_33 on the older revision
 
 const char* eventName(button::ButtonEvent e)
@@ -360,6 +362,72 @@ extern "C" void app_main(void)
         }
     }
 
+    // The touch panel shares the bus with the IMU and the RTC, so it borrows a
+    // Device the application owns, exactly like the IMU above.
+    //
+    // 400 kHz, not the 100 kHz that gets copied out of older Waveshare
+    // examples. Section 4.5 of the CST816S datasheet gives the chip a
+    // 10 kHz..400 kHz range and section 6.b recommends 400 kHz as the maximum
+    // for reliable communication, and i2c-bus-design.md section 3 already
+    // budgets this device at 400 kHz. A device speed is per-device on this
+    // driver, so nothing else on the bus is affected either way.
+    static i2c::Device        touchDev;
+    static touch::TouchManager touchMgr;
+    if (i2cReady && i2cBus.createDevice(kTouchAddr, 400000, touchDev) == ESP_OK) {
+        touch::Wiring twire{};  // the defaults already describe V2.1
+
+        touch::Behavior thow{};
+        // BRING-UP ONLY. Prints every frame as raw hex plus its decode, which
+        // is what settles the orientation flags and the event-flag semantics
+        // from a captured log instead of from a guess. Turn this off once the
+        // numbers are known: at 100 Hz during a drag it changes the timing it
+        // is measuring.
+        thow.logFrames = true;
+
+        touch::Geometry tgeo{};
+        // Deliberately the IDENTITY, and this is the one thing here that is
+        // expected to be wrong.
+        //
+        // The digitiser reports in the glass's own frame, and nothing in any
+        // document says how that lines up with what the ST7789 puts on screen
+        // (dwire/dcfg currently ask for mirrorX and mirrorY). Guessing would
+        // produce a panel that responds in a mirror image -- subtly wrong, and
+        // hard to attribute to any one of the three flags. So it starts as the
+        // identity, which is OBVIOUSLY wrong, and thow.logFrames prints
+        // raw(x,y) -> (x,y) for every touch: one press in a known corner names
+        // the right combination, and it becomes three booleans here.
+        //
+        // The LCD memory gap (display::Geometry::yGap = 20) is NOT part of
+        // this. It describes where the visible window sits inside the ST7789's
+        // 240x320 of GRAM, not where a finger is on the glass.
+        tgeo.orientation.rawWidth  = dcfg.geometry.width;
+        tgeo.orientation.rawHeight = dcfg.geometry.height;
+        tgeo.limits.width          = dcfg.geometry.width;
+        tgeo.limits.height         = dcfg.geometry.height;
+
+        if (touchMgr.init(touchDev, twire, thow, tgeo) == ESP_OK
+            && touchMgr.start() == ESP_OK) {
+            // Self-proving bring-up, like buzzerSelfTest() and logScan() above.
+            // The last argument asks the operator to touch the screen; frames
+            // that arrive during that window are counted and printed.
+            touch::SelfTestResult tst{};
+            touchMgr.runSelfTest(tst, 4000);
+
+            if (!tst.intIdleLevelOk) {
+                ESP_LOGE(TAG, "INT GPIO14 khong nghi o muc mong doi -- moi ngat sau day "
+                              "deu dang ngo");
+            }
+            if (!tst.touchObserved) {
+                ESP_LOGW(TAG, "khong nhan duoc frame nao. Neu ban CO cham man hinh thi "
+                              "xem lai IRQ (0xFA) va day noi INT, khong phai code doc frame");
+            }
+        } else {
+            ESP_LOGE(TAG, "cam ung khong khoi tao duoc");
+        }
+    } else if (i2cReady) {
+        ESP_LOGE(TAG, "khong tao duoc thiet bi I2C 0x%02X (cam ung)", kTouchAddr);
+    }
+
     // Buttons last: a button already held down at start() is caught by the
     // very first poll, and everything that reacts to it -- the buzzer, the
     // calibration gesture -- must already exist by then.
@@ -381,11 +449,34 @@ extern "C" void app_main(void)
     // to fill up and start dropping events -- which is exactly what the
     // "queue day, bo su kien 0" warnings were saying.
     button::ButtonEventMsg msg;
+    uint32_t               lastTouchDiagMs = 0;
     for (;;) {
         imu::ImuEventMsg iev;
         while (imuMgr.waitEvent(iev, 0)) {
             ESP_LOGI(TAG, "IMU  %-15s  t=%" PRIu32 " ms", imuEventName(iev.type),
                      iev.timestampMs);
+        }
+
+        // Drained the way TouchLvglAdapter will drain it once LVGL is wired up:
+        // pop until empty, every pass. Move collapses inside the tracker, so a
+        // drag produces one entry per pass here rather than one per interrupt.
+        touch::TouchTransition tt;
+        while (touchMgr.popTransition(tt)) {
+            ESP_LOGI(TAG, "CHAM %-4s  (%3d,%3d)  seq=%" PRIu32 "  t=%" PRIu32 " ms%s",
+                     touch::toString(tt.kind), static_cast<int>(tt.x),
+                     static_cast<int>(tt.y), tt.sequence, tt.timestampMs,
+                     tt.synthetic ? "   [tu sinh]" : "");
+        }
+
+        // Counters, on a slow timer. The per-frame detail is in the raw log
+        // above; this is the summary that answers "is the release timeout
+        // right" and "is anything being dropped".
+        if (touchMgr.isRunning()) {
+            const uint32_t nowTick = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            if (nowTick - lastTouchDiagMs >= 10000) {
+                lastTouchDiagMs = nowTick;
+                touchMgr.logDiagnostics("dinh ky 10 s");
+            }
         }
 
         if (!btn.waitEvent(msg, 100)) {
