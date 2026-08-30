@@ -23,7 +23,8 @@ enum class ButtonState : uint8_t {
     PRESSED,            // held down, not yet known if click or long press
     WAIT_DOUBLE_CLICK,  // released, waiting to see if a second click arrives
     WAIT_RELEASE_LONG,  // LONG_PRESS already emitted, waiting for release
-    WAIT_RELEASE,       // DOUBLE_CLICK already emitted, wait for release silently
+    WAIT_RELEASE,       // DOUBLE_CLICK already emitted; still watching for a hold
+    WAIT_RELEASE_HOLD,  // DOUBLE_CLICK_HOLD already emitted, wait for release silently
 };
 
 enum class ButtonEvent : uint8_t {
@@ -31,6 +32,14 @@ enum class ButtonEvent : uint8_t {
     PRESS_DOWN,  // the debounced press edge itself, before any gesture is known
     CLICK,
     DOUBLE_CLICK,
+
+    // The second press of a double click, still held past longPressMs. It gets a
+    // name of its own instead of reusing LONG_PRESS because DOUBLE_CLICK has
+    // ALREADY gone out by then and cannot be taken back: an app that mapped
+    // LONG_PRESS to "go back" would run both actions for this one gesture.
+    // A distinct value lets the switch in the app tell the two apart.
+    DOUBLE_CLICK_HOLD,
+
     LONG_PRESS,
     LONG_PRESS_RELEASE,
 };
@@ -53,6 +62,17 @@ struct ButtonBehavior {
     // can feel. PRESS_DOWN reports the pin, not a gesture, so nothing is pending
     // and it goes out as soon as the debounce integrator settles.
     bool     enablePressDown{false};
+
+    // Off by default for the same reason as enablePressDown: it appends an event
+    // to a gesture that used to end at DOUBLE_CLICK.
+    //
+    // With this off, holding the second press of a double click produces nothing
+    // at all -- the FSM deliberately swallows it, because DOUBLE_CLICK has
+    // already been reported and a second event for the same gesture would make
+    // the app run two actions. Turn it on to get DOUBLE_CLICK_HOLD instead of
+    // silence. Reuses longPressMs as the threshold, measured from the SECOND
+    // press.
+    bool     enableDoubleClickHold{false};
 
     uint32_t longPressMs{800};
     uint32_t doubleClickMs{250};
@@ -130,6 +150,13 @@ private:
     ButtonState fsmState_{ButtonState::IDLE};
     uint32_t    pressTimestamp_{0};
     uint32_t    clickTimestamp_{0};
+
+    // Start of the SECOND press of a double click. A separate field is required:
+    // pressTimestamp_ deliberately keeps pointing at the first press so that
+    // pressTimestampMs() always reports where the gesture began, so measuring the
+    // hold from it would include the gap between the two clicks and make the
+    // threshold shrink the faster the user double clicks.
+    uint32_t    holdStartMs_{0};
 };
 
 }  // namespace button

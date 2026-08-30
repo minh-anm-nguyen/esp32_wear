@@ -32,6 +32,7 @@ static const char* name(ButtonEvent e)
     case ButtonEvent::PRESS_DOWN:         return "PRESS_DOWN";
     case ButtonEvent::CLICK:              return "CLICK";
     case ButtonEvent::DOUBLE_CLICK:       return "DOUBLE_CLICK";
+    case ButtonEvent::DOUBLE_CLICK_HOLD:  return "DOUBLE_CLICK_HOLD";
     case ButtonEvent::LONG_PRESS:         return "LONG_PRESS";
     case ButtonEvent::LONG_PRESS_RELEASE: return "LONG_PRESS_RELEASE";
     }
@@ -199,7 +200,8 @@ static void test_double_click_then_hold()
     s.feed(true, 3000);      // hold for 3 seconds after the double click
     s.feed(false, 200);
     EXPECT(seq(s.events, {ButtonEvent::DOUBLE_CLICK}),
-           "WAIT_RELEASE phai nuot phan duoi, khong co LONG_PRESS ma. nhan: %s",
+           "mac dinh enableDoubleClickHold=false -> WAIT_RELEASE nuot phan duoi, "
+           "khong LONG_PRESS ma, khong ca DOUBLE_CLICK_HOLD. nhan: %s",
            join(s.events).c_str());
     EXPECT(s.btn().getState() == ButtonState::IDLE, "phai ve IDLE sau khi nha");
     EXPECT(s.btn().isIdle(), "isIdle() phai true de manager duoc ngu");
@@ -419,6 +421,104 @@ static void test_reset()
     EXPECT(s.btn().pressTimestampMs() == 0, "reset phai xoa pressTimestamp_");
 }
 
+static ButtonBehavior holdCfg()
+{
+    ButtonBehavior c = baseCfg();
+    c.enableDoubleClickHold = true;
+    return c;
+}
+
+static void test_double_click_hold_enabled()
+{
+    Sim s(holdCfg(), 10);
+    s.feed(true, 60);
+    s.feed(false, 120);
+    s.feed(true, 3000);      // giu 3 giay sau double click
+    s.feed(false, 200);
+    EXPECT(seq(s.events, {ButtonEvent::DOUBLE_CLICK, ButtonEvent::DOUBLE_CLICK_HOLD}),
+           "bat enableDoubleClickHold -> DOUBLE_CLICK roi DOUBLE_CLICK_HOLD. nhan: %s",
+           join(s.events).c_str());
+    EXPECT(s.btn().getState() == ButtonState::IDLE, "phai ve IDLE sau khi nha");
+    EXPECT(s.btn().isIdle(), "isIdle() phai true de manager duoc ngu");
+}
+
+static void test_double_click_hold_fires_once()
+{
+    // Giu 3 giay = 300 chu ky poll deu thoa nguong. Neu thieu trang thai
+    // WAIT_RELEASE_HOLD thi su kien se ban ra moi chu ky.
+    Sim s(holdCfg(), 10);
+    s.feed(true, 60);
+    s.feed(false, 120);
+    s.feed(true, 3000);
+    s.feed(false, 200);
+    int count = 0;
+    for (auto e : s.events) {
+        if (e == ButtonEvent::DOUBLE_CLICK_HOLD) ++count;
+    }
+    EXPECT(count == 1, "DOUBLE_CLICK_HOLD phai ban DUNG mot lan, thuc te %d", count);
+}
+
+static void test_double_click_hold_timed_from_second_press()
+{
+    // Day la ca chong hoi quy quan trong nhat cua tinh nang nay.
+    // canh nhan 1 tai t=10, canh nhan 2 tai t=190, longPressMs=800.
+    //   dung  : do tu cu nhan THU HAI  -> 190 + 800 = 990
+    //   sai   : do tu pressTimestamp_  ->  10 + 800 = 810
+    // Do tu moc dau tien se lam nguong ngan di dung bang khoang nghi giua hai click.
+    Sim s(holdCfg(), 10);
+    s.feed(true, 60);
+    s.feed(false, 120);
+    s.feed(true, 2000);
+    s.feed(false, 200);
+
+    EXPECT(s.stamps.size() == 2, "mong 2 su kien, nhan: %s", join(s.events).c_str());
+    if (s.stamps.size() == 2) {
+        EXPECT(s.stamps[0] == 190, "DOUBLE_CLICK tai t=%u, mong 190", s.stamps[0]);
+        EXPECT(s.stamps[1] == 990,
+               "DOUBLE_CLICK_HOLD tai t=%u, mong 990 (=190+800). Neu ra 810 tuc la "
+               "dang do nham tu pressTimestamp_", s.stamps[1]);
+    }
+}
+
+static void test_double_click_hold_keeps_gesture_start()
+{
+    // pressTimestampMs van tro ve dau cu chi, tuc cu nhan THU NHAT.
+    Sim s(holdCfg(), 10);
+    s.feed(true, 60);
+    s.feed(false, 120);
+    s.feed(true, 2000);
+    s.feed(false, 200);
+    EXPECT(s.pressStamps.size() == 2, "mong 2 su kien");
+    if (s.pressStamps.size() == 2) {
+        EXPECT(s.pressStamps[0] == 10 && s.pressStamps[1] == 10,
+               "ca hai su kien cung mot cu chi -> pressTimestampMs = 10, thuc te %u va %u",
+               s.pressStamps[0], s.pressStamps[1]);
+    }
+}
+
+static void test_double_click_hold_released_early()
+{
+    // Nha tay truoc nguong -> chi co DOUBLE_CLICK, khong co HOLD.
+    Sim s(holdCfg(), 10);
+    s.feed(true, 60);
+    s.feed(false, 120);
+    s.feed(true, 400);       // < longPressMs 800
+    s.feed(false, 300);
+    EXPECT(seq(s.events, {ButtonEvent::DOUBLE_CLICK}),
+           "nha som thi khong duoc co DOUBLE_CLICK_HOLD. nhan: %s",
+           join(s.events).c_str());
+}
+
+static void test_plain_long_press_unaffected()
+{
+    // Bat co moi khong duoc dung toi duong long press thong thuong.
+    Sim s(holdCfg(), 10);
+    s.feed(true, 1000);
+    s.feed(false, 200);
+    EXPECT(seq(s.events, {ButtonEvent::LONG_PRESS, ButtonEvent::LONG_PRESS_RELEASE}),
+           "long press thuong phai giu nguyen. nhan: %s", join(s.events).c_str());
+}
+
 // ------------------------------------------------------------------------ main
 
 int main()
@@ -445,6 +545,12 @@ int main()
         {"PRESS_DOWN + LONG_PRESS + RELEASE",      test_press_down_long_press},
         {"PRESS_DOWN van bi debounce",             test_press_down_still_debounced},
         {"reset()",                                test_reset},
+        {"bat hold -> DOUBLE_CLICK_HOLD",          test_double_click_hold_enabled},
+        {"DOUBLE_CLICK_HOLD chi ban mot lan",      test_double_click_hold_fires_once},
+        {"hold do tu cu nhan THU HAI",             test_double_click_hold_timed_from_second_press},
+        {"hold giu nguyen moc dau cu chi",         test_double_click_hold_keeps_gesture_start},
+        {"nha som -> khong co hold",               test_double_click_hold_released_early},
+        {"long press thuong khong bi anh huong",   test_plain_long_press_unaffected},
     };
 
     std::printf("=== test Button (logic thuan) ===\n");

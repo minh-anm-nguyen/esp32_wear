@@ -16,6 +16,7 @@ void Button::reset()
     fsmState_        = ButtonState::IDLE;
     pressTimestamp_  = 0;
     clickTimestamp_  = 0;
+    holdStartMs_     = 0;
 }
 
 // Integrator with hysteresis: the stable state only flips when the counter
@@ -96,8 +97,9 @@ ButtonEvent Button::update(bool rawPressed, uint32_t nowMs)
         // DOUBLE_CLICK wins -- the user did land the second press inside the
         // window.
         if (pressedEdge) {
-            fsmState_ = ButtonState::WAIT_RELEASE;
-            ev        = ButtonEvent::DOUBLE_CLICK;
+            fsmState_    = ButtonState::WAIT_RELEASE;
+            holdStartMs_ = nowMs;   // the hold is timed from HERE, not pressTimestamp_
+            ev           = ButtonEvent::DOUBLE_CLICK;
         } else if ((nowMs - clickTimestamp_) >= behavior_.doubleClickMs) {
             fsmState_ = ButtonState::IDLE;
             ev        = ButtonEvent::CLICK;
@@ -115,6 +117,22 @@ ButtonEvent Button::update(bool rawPressed, uint32_t nowMs)
         // Swallow the tail of the press that DOUBLE_CLICK already consumed.
         // Without this exit the FSM latches forever and the manager task can
         // never go back to sleep.
+        if (releasedEdge) {
+            fsmState_ = ButtonState::IDLE;
+        } else if (behavior_.enableDoubleClickHold && stableState_ &&
+                   (nowMs - holdStartMs_) >= behavior_.longPressMs) {
+            // Same structural exclusion as in PRESSED: releasedEdge needs
+            // stableState_ == false, this branch needs it true.
+            fsmState_ = ButtonState::WAIT_RELEASE_HOLD;
+            ev        = ButtonEvent::DOUBLE_CLICK_HOLD;
+        }
+        break;
+
+    case ButtonState::WAIT_RELEASE_HOLD:
+        // DOUBLE_CLICK_HOLD has been reported; stay silent until the finger
+        // lifts. Existing for the same reason as WAIT_RELEASE_LONG: without a
+        // state to move into, the threshold would keep matching and the event
+        // would fire on every poll cycle for as long as the button is held.
         if (releasedEdge) {
             fsmState_ = ButtonState::IDLE;
         }

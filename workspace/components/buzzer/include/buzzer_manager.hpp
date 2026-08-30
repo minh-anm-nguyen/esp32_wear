@@ -50,18 +50,27 @@ public:
         // maxFreqHz rather than letting high notes come out silently wrong.
         ledc_timer_bit_t resolution{LEDC_TIMER_10_BIT};
 
-        // LEDC_AUTO_CLK usually lands on APB, and on the ESP32-S3 the APB clock
-        // follows CPU_CLK. With esp_pm dynamic frequency scaling that means the
-        // divider computed by ledc_set_freq() silently goes wrong and notes come
-        // out at the wrong pitch -- the LEDC driver holds no PM lock of its own.
+        // NOT A PER-BUZZER CHOICE. On the ESP32-S3 the LEDC clock source is
+        // GLOBAL: every timer must agree on it, because the chip has no
+        // timer-specific clock mux (driver/ledc.h, ledc_timer_config_t::clk_cfg,
+        // and the absence of SOC_LEDC_HAS_TIMER_SPECIFIC_MUX in soc_caps.h).
+        // Two timers asking for different sources is not a warning --
+        // ledc_timer_config() returns ESP_FAIL to whichever one comes second,
+        // and which one that is depends on app_main() ordering.
         //
-        // This manager solves that by holding an ESP_PM_APB_FREQ_MAX lock for
-        // exactly as long as a pattern is playing (see the note on sleepMode),
-        // so the default stays on the accurate clock.
+        // So this value is shared with components/display, and XTAL is what
+        // display needs: it is the only accurate source that stays powered
+        // through light sleep, which the backlight requires (it must not go
+        // dark while the user is looking at the screen). RC_FAST also survives
+        // sleep but is +/-7%, wide enough to detune a note audibly.
         //
-        // Switch to LEDC_USE_RC_FAST_CLK only together with sleepMode =
-        // LEDC_SLEEP_MODE_KEEP_ALIVE, and read that comment first.
-        ledc_clk_cfg_t clockSource{LEDC_AUTO_CLK};
+        // It used to be LEDC_AUTO_CLK, which lands on APB. APB follows CPU_CLK,
+        // so dynamic frequency scaling would shift the pitch -- which is why
+        // this class holds an ESP_PM_APB_FREQ_MAX lock while a pattern plays.
+        // XTAL does not follow CPU_CLK, so THAT LOCK IS NOW REDUNDANT and can be
+        // removed once the light-sleep measurement confirms this on hardware.
+        // See doc-design/display.md sections 10.2, 10.3 and 16.2.
+        ledc_clk_cfg_t clockSource{LEDC_USE_XTAL_CLK};
 
         // What the LEDC channel does when the system enters light sleep.
         //

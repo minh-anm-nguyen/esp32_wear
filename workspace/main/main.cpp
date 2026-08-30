@@ -18,6 +18,8 @@
 // whenever no note is playing or the transistor keeps conducting.
 #include "button_manager.hpp"
 #include "buzzer_manager.hpp"
+#include "display_manager.hpp"
+#include "display_selftest.hpp"
 #include "i2c_device.hpp"
 #include "imu_manager.hpp"
 #include "motion_controller.hpp"
@@ -46,6 +48,7 @@ const char* eventName(button::ButtonEvent e)
     case button::ButtonEvent::PRESS_DOWN:         return "PRESS_DOWN";
     case button::ButtonEvent::CLICK:              return "CLICK";
     case button::ButtonEvent::DOUBLE_CLICK:       return "DOUBLE_CLICK";
+    case button::ButtonEvent::DOUBLE_CLICK_HOLD:  return "DOUBLE_CLICK_HOLD";
     case button::ButtonEvent::LONG_PRESS:         return "LONG_PRESS";
     case button::ButtonEvent::LONG_PRESS_RELEASE: return "LONG_PRESS_RELEASE";
     case button::ButtonEvent::NONE:               return "NONE";
@@ -202,6 +205,7 @@ extern "C" void app_main(void)
     button::ButtonBehavior bhow{};
     bhow.enableDoubleClick = true;   // on, so all the gesture types show up
     bhow.enablePressDown   = true;   // feedback must not wait for doubleClickMs
+    bhow.enableDoubleClickHold = true;  // double click then keep holding -> DOUBLE_CLICK_HOLD
     bhow.longPressMs       = 800;
     bhow.doubleClickMs     = 250;
     bhow.debounceMs        = 20;     // real time, correct at any tick rate
@@ -223,6 +227,43 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(buz.init(zwire, zspec));
     ESP_ERROR_CHECK(buz.start());
     buzzerSelfTest(buz, zwire, zspec);
+
+    // The screen comes up next, and the ORDER RELATIVE TO THE BUZZER matters for
+    // a reason that has nothing to do with either device: both configure a LEDC
+    // timer, and on the ESP32-S3 the LEDC clock source is global to the whole
+    // peripheral. They now agree on LEDC_USE_XTAL_CLK so either order works --
+    // but if one of them ever drifts back to LEDC_AUTO_CLK, whichever runs
+    // second dies with a bare ESP_FAIL from ledc_timer_config().
+    // See doc-design/display.md section 10.2.
+    //
+    // Not ESP_ERROR_CHECK, same reasoning as the I2C bus below: a watch that
+    // cannot bring up its screen should still buzz and still count steps, and a
+    // boot loop would scroll the one useful error message past too fast to read.
+    static display::DisplayManager disp;
+    const display::Wiring dwire{};  // the defaults already describe this board
+    display::Config       dcfg{};
+
+    const esp_err_t derr = disp.init(dwire, dcfg);
+    if (derr == ESP_OK) {
+        // Self-proving bring-up, like buzzerSelfTest() above and logScan()
+        // below. MISO is not wired on this board, so the firmware cannot read
+        // GRAM back: the colour and orientation checks are for your eyes, and
+        // the log says what each pattern should look like and which Config
+        // field to change when it does not.
+        display::SelfTestResult dst{};
+        display::runSelfTest(disp, dst, 800);
+
+        if (!dst.callbackFired) {
+            ESP_LOGE(TAG, "callback DMA khong chay -- flush cua LVGL se treo o buoc 5");
+        }
+        if (!dst.sleepWakeOk) {
+            ESP_LOGE(TAG, "chu ky sleep/wake that bai sau %" PRIu32 " lan",
+                     dst.sleepWakeCycles);
+        }
+    } else {
+        ESP_LOGE(TAG, "khong khoi tao duoc man hinh: %s -- phan con lai van chay",
+                 esp_err_to_name(derr));
+    }
 
     // The bus has exactly one owner, created here and handed to every driver
     // by reference. Nobody else calls i2c_new_master_bus().
