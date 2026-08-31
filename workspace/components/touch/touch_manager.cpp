@@ -756,6 +756,12 @@ void TouchManager::handleFrame(const ParsedFrame& frame, uint32_t now, const uin
         tracker_.onFrame(frame, point, now);
         unlock();
     }
+
+    // Wake whoever drains this queue. From the touch TASK, not an ISR, so the
+    // plain xTaskNotifyGive is correct here.
+    if (wakeTarget_ != nullptr) {
+        xTaskNotifyGive(wakeTarget_);
+    }
 }
 
 // ----------------------------------------------------------------- recovery
@@ -893,8 +899,31 @@ esp_err_t TouchManager::requestMode(Mode mode, uint32_t timeoutMs)
 
 // ----------------------------------------------------------------- UI-facing
 
+void TouchManager::checkSingleConsumer()
+{
+    TaskHandle_t self = xTaskGetCurrentTaskHandle();
+
+    if (consumer_ == nullptr) {
+        consumer_ = self;  // first caller claims the queue
+        return;
+    }
+    if (consumer_ == self || consumerWarned_) {
+        return;
+    }
+
+    consumerWarned_ = true;
+    ESP_LOGE(TAG,
+             "hang doi cham bi RUT TU HAI TASK ('%s' va '%s'). popTransition() "
+             "TIEU THU, nen ben nay an mat su kien cua ben kia -- mot cai Up bi "
+             "cuop di se lam LVGL ket o trang thai dang cham cho toi lan cham ke "
+             "tiep. Chi UI task duoc pop.",
+             pcTaskGetName(consumer_), pcTaskGetName(self));
+}
+
 bool TouchManager::popTransition(TouchTransition& out)
 {
+    checkSingleConsumer();
+
     if (!lock()) {
         return false;
     }

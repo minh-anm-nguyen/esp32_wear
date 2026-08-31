@@ -12,6 +12,11 @@
 // only arrangement in which that claim is actually true.
 //
 // See doc-design/imu-qmi8658c-design.md section 18.
+//
+// ONE PRODUCER, MANY CONSUMERS: a driver holds a single ISampleSink*, which is
+// all a driver should know about. When several things need the same stream, put
+// a sensors::SampleFanout in that one slot -- see sample_fanout.hpp next door,
+// and doc-design/app-architecture.md section 3.
 #pragma once
 
 #include <cstdint>

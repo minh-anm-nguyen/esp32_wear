@@ -52,6 +52,22 @@ public:
     uint32_t  consecutiveErrors() const { return consecutiveErrors_; }
     bool      healthy() const { return consecutiveErrors_ < kDeadThreshold; }
 
+    // LIFETIME error history, because consecutiveErrors_ cannot carry it.
+    //
+    // That counter resets on the very next success, which is correct for
+    // "is this chip dead right now" and useless for "did anything go wrong
+    // since boot". A single isolated failure erased itself within one poll
+    // interval, so the only trace an event left was the IDF driver's own
+    // "I2C transaction timeout detected" -- an error with no address on it,
+    // impossible to attribute to a chip afterwards.
+    //
+    // These four make the next one attributable: which device, how many, how
+    // close it came to the dead threshold, and when it last happened.
+    uint32_t  totalErrors() const { return totalErrors_; }
+    uint32_t  worstErrorStreak() const { return worstErrorStreak_; }
+    esp_err_t lastFailure() const { return lastFailure_; }
+    uint32_t  lastFailureMs() const { return lastFailureMs_; }
+
     // Hand the device to the calling task.
     //
     // The one-task-one-device rule has a legitimate exception: a driver is
@@ -87,8 +103,14 @@ private:
     bool         ownerWarned_{false};
     bool         sizeWarned_{false};
 
-    esp_err_t lastError_{ESP_OK};
-    uint32_t  consecutiveErrors_{0};
+    esp_err_t lastError_{ESP_OK};       // last transfer, success included
+    uint32_t  consecutiveErrors_{0};    // current streak, reset by any success
+
+    // Never reset. See totalErrors() above.
+    uint32_t  totalErrors_{0};
+    uint32_t  worstErrorStreak_{0};
+    esp_err_t lastFailure_{ESP_OK};     // last FAILURE, survives later successes
+    uint32_t  lastFailureMs_{0};
 };
 
 // ------------------------------------------------------------------ BusManager

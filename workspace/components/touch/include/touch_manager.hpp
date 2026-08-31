@@ -279,7 +279,37 @@ public:
     // lv_indev_data_t from the transition and set `continue_reading` while this
     // keeps returning true, and a tap that happened entirely between two polls
     // still reaches the widget.
+    //
+    // EXACTLY ONE CONSUMER. popTransition() CONSUMES: a second caller does not
+    // observe the queue, it steals from the first one.
+    //
+    // This is not theoretical. app_main once drained this queue "just for
+    // logging" alongside the LVGL input callback, and the symptom was baffling:
+    // a vertical swipe off the edge of the screen would sometimes leave the
+    // touch stuck down, released only by the NEXT touch. Whoever won the race
+    // for the Up got it; when that was the logger, LVGL stayed at
+    // LV_INDEV_STATE_PRESSED forever.
+    //
+    // Enforced at runtime by the same mechanism as i2c::Device -- see
+    // checkOwningTask() below -- because an invariant that only exists in a
+    // comment is an invariant that gets broken.
     bool popTransition(TouchTransition& out);
+
+    // Task to poke when a transition is queued. Optional; nullptr disables it.
+    //
+    // WHY THE CONSUMER CANNOT JUST POLL
+    //
+    // The UI task sleeps for up to a second when nothing is happening, which is
+    // exactly right for battery -- but it meant the FIRST touch after an idle
+    // period waited for that sleep to expire before anyone looked at the queue.
+    // Measured on the board: average sample age 108 ms, worst case 764 ms,
+    // against a chip that reports every 12 ms. Every millisecond of tuning
+    // downstream was wasted while the reader was asleep.
+    //
+    // A task notification is the cheapest possible fix: it is latched, so a
+    // poke that lands while the consumer is busy is not lost, and it costs
+    // nothing at all when nobody is touching the glass.
+    void setWakeTarget(TaskHandle_t task) { wakeTarget_ = task; }
 
     // Current state without consuming anything. Safe from any task.
     TouchSnapshot snapshot() const;
@@ -323,8 +353,18 @@ private:
     // short enough that a real stuck line does not lock touch out for a second.
     static constexpr uint8_t kIntStuckTicksBeforeRecovery = 5;
 
+    TaskHandle_t consumer_{nullptr};
+    TaskHandle_t wakeTarget_{nullptr};
+    bool         consumerWarned_{false};
+
     static void IRAM_ATTR isrHandler(void* arg);
     static void           taskFunc(void* arg);
+
+    // Same mechanism as i2c::Device::checkOwningTask(): the first task to pop
+    // claims the queue, and a second one gets ONE loud error rather than a
+    // silent theft. Warned once only -- an invariant violated at 60 Hz would
+    // bury the message it is trying to draw attention to.
+    void checkSingleConsumer();
 
     void run();
     void serviceInterrupts(uint32_t nowMs);

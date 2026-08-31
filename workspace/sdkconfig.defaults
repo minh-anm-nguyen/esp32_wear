@@ -125,3 +125,19 @@ CONFIG_LV_USE_ASSERT_MALLOC=y
 # frame timing it is supposed to help measure. Turn on together with
 # CONFIG_LV_LOG_LEVEL when a bring-up step is actually silent about a failure.
 CONFIG_LV_USE_LOG=n
+
+# --- LVGL: font cho icon launcher -----------------------------------------
+# doc-design/app-architecture.md section 6.
+#
+# Montserrat 14 (the default) is the text font. 28 exists purely so the launcher
+# icons are legible on a 240x280 panel at arm's length.
+#
+# The icons are LV_SYMBOL_* strings, and the built-in Montserrat fonts carry the
+# FontAwesome glyphs alongside the Latin ones -- verified in
+# lv_font_montserrat_28.c, whose generator line includes codepoints 61441..63650
+# (61459 = LV_SYMBOL_SETTINGS, 61451 = LV_SYMBOL_LIST, and so on).
+#
+# That is the whole reason there is no asset pipeline yet: no image decoder, no
+# converter, no extra build step, and nothing to do before the first icon can be
+# seen. Real artwork is a later and separate decision.
+CONFIG_LV_FONT_MONTSERRAT_28=y

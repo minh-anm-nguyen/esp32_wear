@@ -95,6 +95,18 @@ bool Device::transfer(const uint8_t* tx, std::size_t txLen,
     if (consecutiveErrors_ < UINT32_MAX) {
         ++consecutiveErrors_;
     }
+    // Recorded before anything decides whether this failure is worth a line.
+    // The isolated one never is -- and it was exactly the isolated one that
+    // left no evidence to attribute later.
+    if (totalErrors_ < UINT32_MAX) {
+        ++totalErrors_;
+    }
+    if (consecutiveErrors_ > worstErrorStreak_) {
+        worstErrorStreak_ = consecutiveErrors_;
+    }
+    lastFailure_   = err;
+    lastFailureMs_ = static_cast<uint32_t>(pdTICKS_TO_MS(xTaskGetTickCount()));
+
     // Exactly at the threshold, once: enough to explain a silent device without
     // flooding the log while it stays dead.
     if (consecutiveErrors_ == kDeadThreshold) {

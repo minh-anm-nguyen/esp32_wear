@@ -1,33 +1,33 @@
-// Demo for the button + buzzer components.
+// Composition root and product policy. Nothing else.
 //
-// GPIO0 is the BOOT button on most ESP32-S3 devkits, so this is testable right
-// after flashing. GPIO0 is a strapping pin: fine to use, just remember it selects
-// the boot mode at reset time (see section 11 of the design document).
+// WHAT MOVED OUT, AND WHY
 //
-// The buzzer sits on GPIO42, which is where the V2.1 pinout of this board puts
-// it. Boards from the older revision use GPIO33 instead, so check the silkscreen
-// before blaming the firmware.
+// This file used to be 530 lines doing three jobs: wiring the hardware, running
+// a loop, and deciding product behaviour. Only the first belongs in one place;
+// the other two are what made it grow with every feature and what would have
+// made it the file every future app has to edit.
 //
-// GPIO42 is MTMS, one of the four JTAG pins (39 MTCK, 40 MTDO, 41 MTDI, 42 MTMS).
-// That is harmless here because the ESP32-S3 debugs over its built-in USB
-// Serial/JTAG on GPIO19/20; it only matters if you wire an external JTAG probe
-// to the MTxx pins, which would then fight the buzzer for the pad.
+//   board.hpp     every driver on this board, and the order they come up in
+//   services.hpp  the domain layer: driver output -> facts an app can read
+//   main.cpp      what this product DOES with them
 //
-// Driver stage: GPIO42 -> base resistor -> SS8050 NPN, buzzer between 3V3 and the
-// collector. Active high, so activeLow stays false, and the pad must sit LOW
-// whenever no note is playing or the transistor keeps conducting.
-#include "button_manager.hpp"
-#include "buzzer_manager.hpp"
-#include "display_manager.hpp"
-#include "display_selftest.hpp"
-#include "i2c_device.hpp"
-#include "imu_manager.hpp"
-#include "motion_controller.hpp"
-#include "touch_manager.hpp"
+// See doc-design/app-architecture.md sections 5 and 7.
+#include "board.hpp"
+#include "crash_log.hpp"
+#include "daemon_host.hpp"
+#include "services.hpp"
+#include "ui_manager.hpp"
+
+#include "diag_app.hpp"
+#include "touch_app.hpp"
+#include "wrist_app.hpp"
+#include "wrist_daemon.hpp"
 
 #include <cinttypes>
+#include <cstdio>
 
-#include "driver/ledc.h"   // self-test only: reads the peripheral back
+#include "esp_heap_caps.h"
+
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -36,13 +36,7 @@ namespace {
 
 constexpr const char* TAG = "app";
 
-constexpr gpio_num_t kButtonPin = GPIO_NUM_0;
-constexpr gpio_num_t kI2cSda    = GPIO_NUM_11;  // dung chung: cam ung + RTC + IMU
-constexpr gpio_num_t kI2cScl    = GPIO_NUM_10;
-constexpr gpio_num_t kImuInt    = GPIO_NUM_38;  // QMI_INT2 (INT1 khong ra chan)
-constexpr uint16_t   kImuAddr   = 0x6B;
-constexpr uint16_t   kTouchAddr = 0x15;         // CST816T, RST=GPIO13, INT=GPIO14
-constexpr gpio_num_t kBuzzerPin = GPIO_NUM_42;  // GPIO_NUM_33 on the older revision
+// ---------------------------------------------------------------- log helpers
 
 const char* eventName(button::ButtonEvent e)
 {
@@ -50,30 +44,10 @@ const char* eventName(button::ButtonEvent e)
     case button::ButtonEvent::PRESS_DOWN:         return "PRESS_DOWN";
     case button::ButtonEvent::CLICK:              return "CLICK";
     case button::ButtonEvent::DOUBLE_CLICK:       return "DOUBLE_CLICK";
-    case button::ButtonEvent::DOUBLE_CLICK_HOLD:  return "DOUBLE_CLICK_HOLD";
     case button::ButtonEvent::LONG_PRESS:         return "LONG_PRESS";
     case button::ButtonEvent::LONG_PRESS_RELEASE: return "LONG_PRESS_RELEASE";
-    case button::ButtonEvent::NONE:               return "NONE";
-    }
-    return "?";
-}
-
-// One gesture, one sound. This table is the entire coupling between the two
-// components: neither one references the other, the application joins them.
-// Returning a pointer into flash is safe -- the stock patterns are constexpr,
-// so they outlive any playback (see the lifetime note on buzzer::Pattern).
-// Gesture -> sound, decided by the APPLICATION. components/motion has never
-// heard of a buzzer and components/imu has never heard of MotionController;
-// this callback is the only place all three meet. Same arrangement that
-// already joins the button to the buzzer below.
-void onMotionEvent(void* ctx, motion::MotionEvent ev, uint32_t nowMs)
-{
-    auto* buz = static_cast<buzzer::BuzzerManager*>(ctx);
-    if (ev == motion::MotionEvent::WRIST_RAISE) {
-        ESP_LOGI(TAG, "NANG CO TAY (t=%" PRIu32 " ms) -> bat man hinh", nowMs);
-        buz->play(buzzer::patterns::kClick);
-    } else if (ev == motion::MotionEvent::WRIST_LOWER) {
-        ESP_LOGI(TAG, "ha tay (t=%" PRIu32 " ms) -> tat man hinh", nowMs);
+    case button::ButtonEvent::DOUBLE_CLICK_HOLD:  return "DOUBLE_CLICK_HOLD";
+    default:                                      return "?";
     }
 }
 
@@ -90,6 +64,13 @@ const char* imuEventName(imu::ImuEventMsg::Type t)
     }
     return "?";
 }
+
+// -------------------------------------------------------------- product policy
+//
+// Everything below this line is a decision about how the WATCH should behave,
+// not about how the hardware works. It is the part that will migrate into apps
+// once there is an app framework to migrate it into; keeping it in one labelled
+// block is what makes that migration a move rather than an excavation.
 
 const buzzer::Pattern* soundFor(button::ButtonEvent e)
 {
@@ -115,327 +96,58 @@ const buzzer::Pattern* soundFor(button::ButtonEvent e)
     }
 }
 
-// One second of continuous tone, played once at boot.
-constexpr buzzer::Note kSelfTestNotes[] = {{2000, 1000, 100}};
-
-// Separates the two failure modes that sound identical from the outside:
-// firmware not driving the pin at all, versus a pin that carries the right
-// square wave into hardware that cannot make a sound out of it.
+// Runs in the IMU task, via WristService. Product policy: a raise is worth a
+// click, a lower is not.
 //
-// ledc_get_freq() and ledc_get_duty() read the peripheral registers back, so
-// what they print is what the pin is actually doing, not what we asked for.
-void buzzerSelfTest(buzzer::BuzzerManager&      buz,
-                    const buzzer::BuzzerWiring& wiring,
-                    const buzzer::BuzzerSpec&   spec)
+// The EVENT is used here rather than the topic, and that is the distinction
+// topic.hpp is built around: waking the screen is a thing that HAPPENED and
+// must not be coalesced away. What the screen then DISPLAYS comes from the
+// topic. Both exist because they answer different questions.
+void onWristEvent(void* ctx, motion::MotionEvent ev, uint32_t nowMs)
 {
-    ESP_LOGI(TAG, "--- self test: 1 giay am 2000 Hz tren GPIO%d ---",
-             static_cast<int>(wiring.pin));
-
-    const esp_err_t err = buz.play(buzzer::makePattern(kSelfTestNotes, 1, 255));
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "play() that bai: %s", esp_err_to_name(err));
-        return;
+    auto* buz = static_cast<buzzer::BuzzerManager*>(ctx);
+    if (ev == motion::MotionEvent::WRIST_RAISE) {
+        ESP_LOGI(TAG, "NANG CO TAY (t=%" PRIu32 " ms) -> bat man hinh", nowMs);
+        buz->play(buzzer::patterns::kClick);
+    } else if (ev == motion::MotionEvent::WRIST_LOWER) {
+        ESP_LOGI(TAG, "ha tay (t=%" PRIu32 " ms) -> tat man hinh", nowMs);
     }
-
-    // Let the buzzer task pick the command up and program LEDC before reading.
-    vTaskDelay(pdMS_TO_TICKS(200));
-
-    if (spec.type == buzzer::BuzzerType::ACTIVE) {
-        ESP_LOGI(TAG, "  loai ACTIVE: muc GPIO = %d (mong doi %d)",
-                 gpio_get_level(wiring.pin), wiring.activeLow ? 0 : 1);
-    } else {
-        const uint32_t freq = ledc_get_freq(LEDC_LOW_SPEED_MODE, LEDC_TIMER_0);
-        const uint32_t duty = ledc_get_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
-        ESP_LOGI(TAG, "  LEDC doc nguoc: freq=%" PRIu32 " Hz, duty=%" PRIu32 "/1024",
-                 freq, duty);
-
-        // volume 100 is clamped to maxVolume, and volume maps onto the lower half
-        // of the duty range because a piezo is silent at 100% duty.
-        const uint32_t wantDuty = 512u * spec.maxVolume / 100u;
-        if (freq == 0 || duty == 0) {
-            ESP_LOGE(TAG, "  LEDC KHONG chay -> loi phan mem, khong phai day noi");
-        } else if (duty != wantDuty) {
-            ESP_LOGW(TAG, "  duty la %" PRIu32 ", mong doi %" PRIu32, duty, wantDuty);
-        } else {
-            ESP_LOGI(TAG, "  LEDC dung: chan GPIO%d DANG co xung vuong. Neu khong "
-                          "nghe thay gi thi van de nam o day noi hoac loa.",
-                     static_cast<int>(wiring.pin));
-        }
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(1000));  // let the tone finish before the demo starts
 }
 
-}  // namespace
-
-extern "C" void app_main(void)
+// Feeds the diagnostics app. Runs in the UI task, called by the app itself.
+//
+// A snapshot rather than a UiManager pointer: an app must be able to READ the
+// runtime's health without being able to reach in and change it.
+void fillDiagSnapshot(void* ctx, apps::DiagSnapshot& out)
 {
-    // Sampled FIRST, before anything reconfigures the pad. GPIO0 is a
-    // strapping pin and comes out of reset as an input with a pull-up, so
-    // "held down at boot" reads as LOW without any setup. That gives an
-    // entry gesture for calibration with no UI at all.
-    const bool calibrationRequested = (gpio_get_level(kButtonPin) == 0);
+    auto* ui = static_cast<ui::UiManager*>(ctx);
 
-    // The GPIO ISR service is a system-wide singleton, and calling
-    // gpio_install_isr_service() twice makes IDF log an ERROR even though the
-    // second caller handles the return value fine. Install it ONCE here, then
-    // tell both managers not to try -- which also stops the flags being an
-    // accident of whichever component happens to start first.
-    ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_install_isr_service(0));
+    out.frames        = ui->frames();
+    out.flushPerFrame100 =
+        (ui->frames() != 0) ? (ui->flush().started() * 100u / ui->frames()) : 0u;
+    out.flushBalanced   = ui->flush().balanced();
+    out.stackFreeBytes  = ui->taskStackHeadroom();
 
-    // pollIntervalMs derives itself from the tick rate: 10ms at HZ=100, 5ms at HZ=1000.
-    static button::ButtonManager btn{[] {
-        button::ButtonManager::Config c{};
-        c.installIsrService = false;  // app_main owns it
-        return c;
-    }()};
-    static buzzer::BuzzerManager buz;
+    lv_mem_monitor_t m{};
+    lv_mem_monitor(&m);
+    out.lvglFreeBytes    = static_cast<uint32_t>(m.free_size);
+    out.lvglLargestBytes = static_cast<uint32_t>(m.free_biggest_size);
 
-    ESP_LOGI(TAG, "tick rate = %d Hz, 1 tick = %d ms",
-             static_cast<int>(configTICK_RATE_HZ),
-             static_cast<int>(portTICK_PERIOD_MS));
+    out.sramFreeBytes =
+        static_cast<uint32_t>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    out.sramLargestBytes =
+        static_cast<uint32_t>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+}
 
-    // Wiring and behaviour are separate structs on purpose: the first describes
-    // this board, the second describes how the button should feel. Only the
-    // second one reaches the pure-logic layer.
-    button::ButtonWiring bwire{};
-    bwire.pin                = kButtonPin;
-    bwire.activeLow          = true;   // button wired to GND
-    bwire.enableInternalPull = true;
-    bwire.enableWakeup       = false;  // no light sleep in this demo yet
+// ------------------------------------------------------------------- runtime
 
-    button::ButtonBehavior bhow{};
-    bhow.enableDoubleClick = true;   // on, so all the gesture types show up
-    bhow.enablePressDown   = true;   // feedback must not wait for doubleClickMs
-    bhow.enableDoubleClickHold = true;  // double click then keep holding -> DOUBLE_CLICK_HOLD
-    bhow.longPressMs       = 800;
-    bhow.doubleClickMs     = 250;
-    bhow.debounceMs        = 20;     // real time, correct at any tick rate
-
-    buzzer::BuzzerWiring zwire{};
-    zwire.pin       = kBuzzerPin;
-    zwire.activeLow = false;
-
-    buzzer::BuzzerSpec zspec{};
-    zspec.type      = buzzer::BuzzerType::PASSIVE;  // ACTIVE for a self-oscillating
-                                                    // buzzer or a vibration motor
-    zspec.maxVolume = 80;   // a bare piezo driven flat out at 3.3V is painful up close
-    zspec.minFreqHz = 100;
-    zspec.maxFreqHz = 10000;
-
-    // Sound comes up FIRST, before the I2C section. Axis calibration can sit
-    // there for half a minute waiting to be told the watch is still, and a
-    // wrist raise during that window should still be audible.
-    ESP_ERROR_CHECK(buz.init(zwire, zspec));
-    ESP_ERROR_CHECK(buz.start());
-    buzzerSelfTest(buz, zwire, zspec);
-
-    // The screen comes up next, and the ORDER RELATIVE TO THE BUZZER matters for
-    // a reason that has nothing to do with either device: both configure a LEDC
-    // timer, and on the ESP32-S3 the LEDC clock source is global to the whole
-    // peripheral. They now agree on LEDC_USE_XTAL_CLK so either order works --
-    // but if one of them ever drifts back to LEDC_AUTO_CLK, whichever runs
-    // second dies with a bare ESP_FAIL from ledc_timer_config().
-    // See doc-design/display.md section 10.2.
-    //
-    // Not ESP_ERROR_CHECK, same reasoning as the I2C bus below: a watch that
-    // cannot bring up its screen should still buzz and still count steps, and a
-    // boot loop would scroll the one useful error message past too fast to read.
-    static display::DisplayManager disp;
-    const display::Wiring dwire{};  // the defaults already describe this board
-    display::Config       dcfg{};
-
-    const esp_err_t derr = disp.init(dwire, dcfg);
-    if (derr == ESP_OK) {
-        // Self-proving bring-up, like buzzerSelfTest() above and logScan()
-        // below. MISO is not wired on this board, so the firmware cannot read
-        // GRAM back: the colour and orientation checks are for your eyes, and
-        // the log says what each pattern should look like and which Config
-        // field to change when it does not.
-        display::SelfTestResult dst{};
-        display::runSelfTest(disp, dst, 800);
-
-        if (!dst.callbackFired) {
-            ESP_LOGE(TAG, "callback DMA khong chay -- flush cua LVGL se treo o buoc 5");
-        }
-        if (!dst.sleepWakeOk) {
-            ESP_LOGE(TAG, "chu ky sleep/wake that bai sau %" PRIu32 " lan",
-                     dst.sleepWakeCycles);
-        }
-    } else {
-        ESP_LOGE(TAG, "khong khoi tao duoc man hinh: %s -- phan con lai van chay",
-                 esp_err_to_name(derr));
-    }
-
-    // The bus has exactly one owner, created here and handed to every driver
-    // by reference. Nobody else calls i2c_new_master_bus().
-    // See doc-design/i2c-bus-design.md section 2.
-    static i2c::BusManager  i2cBus;
-    i2c::BusManager::Config i2cCfg{};
-    i2cCfg.sda = kI2cSda;
-    i2cCfg.scl = kI2cScl;
-    // NOT ESP_ERROR_CHECK. That aborts, the chip reboots, and the whole thing
-    // becomes an endless boot loop in which the one error message scrolls past
-    // too fast to read -- while the buzzer replays its self-test tone on every
-    // cycle. A watch that cannot reach its IMU should still be a watch.
-    const bool i2cReady = (i2cBus.init(i2cCfg) == ESP_OK);
-    if (!i2cReady) {
-        ESP_LOGE(TAG, "khong mo duoc bus I2C -- bo qua IMU, nut va coi van chay");
-    }
-
-    // Self-proving bring-up: the firmware asks the bus who is out there and
-    // says so, naming what is MISSING as loudly as what is present. No meter,
-    // no scope -- same idea as buzzerSelfTest() above.
-    if (i2cReady) {
-        i2cBus.logScan(TAG);
-    }
-
-    // The IMU borrows a Device the application owns. Static storage: the
-    // Device must outlive every driver holding a reference to it.
-    static i2c::Device imuDev;
-    static imu::ImuManager imuMgr;
-    if (i2cReady && i2cBus.createDevice(kImuAddr, 400000, imuDev) == ESP_OK) {
-        // The IMU pushes samples at whatever implements sensors::ISampleSink.
-        // It never learns that this one recognises wrist raises.
-        static motion::MotionController wrist;
-        wrist.setEventCallback(onMotionEvent, &buz);
-
-        imu::ImuManager::Config icfg{};
-        icfg.bus    = &imuDev;
-        icfg.intPin = kImuInt;
-        icfg.sink   = &wrist;
-        icfg.installIsrService = false;  // app_main owns it
-        // The chip is glued with its Z axis pointing INTO the screen, so the
-        // sign has to be flipped. Measured on the bench, not guessed: with the
-        // identity remap, laying the board glass-up reported a LOWER and
-        // PCB-up reported a RAISE -- exactly backwards.
-        //
-        // The convention this restores (motion_controller.hpp): +Z points OUT
-        // of the screen. Worn on a wrist with the glass facing outward, an arm
-        // hanging by the side puts the screen normal roughly horizontal (~90
-        // degrees, above downThresholdDeg = 65 -> screen off), and raising the
-        // arm to read the time brings it to ~20-40 degrees (below
-        // viewThresholdDeg = 35 -> screen on).
-        //
-        // X and Y are still identity. They do not affect wrist raise, which
-        // only uses the Z component and the magnitude -- but screen rotation
-        // will need them, so run the full calibration (hold BOOT at power-up)
-        // before building that.
-        //
-        // Left at identity while calibrating: runAxisCalibration() can only
-        // derive a mapping from SENSOR-frame readings, and latest() hands back
-        // samples that have already been through the remap.
-        if (!calibrationRequested) {
-            icfg.remap.sign[2] = -1;
-        }
-
-        if (imuMgr.init(icfg) == ESP_OK && imuMgr.start() == ESP_OK) {
-            imu::SelfTestResult st{};
-            imuMgr.runSelfTest(st);   // logs one PASS/FAIL line per check
-
-            // Stay in ACTIVITY so samples keep flowing to the wrist FSM.
-            // WOM would be the real watch idle state, but it produces no
-            // sample stream to demonstrate with.
-            imuMgr.setPowerMode(imu::PowerMode::ACTIVITY);
-
-            if (calibrationRequested) {
-                // The remap cannot be guessed: nobody knows which way the
-                // chip was glued until the board says so. Until this has
-                // been run once and its output pasted below, the tilt
-                // angles are computed on the wrong axes and a wrist raise
-                // may simply never register.
-                imu::AxisRemap measured{};
-                if (imu::runAxisCalibration(imuMgr, measured) == ESP_OK) {
-                    ESP_LOGI(TAG, "dan ket qua tren vao icfg.remap roi nap lai");
-                }
-            } else {
-                ESP_LOGI(TAG, "giu nut BOOT luc khoi dong de hieu chuan truc");
-            }
-
-            ESP_LOGI(TAG, "nang co tay len ngang mat -> se keu mot tieng bip");
-        } else {
-            ESP_LOGE(TAG, "IMU khong khoi tao duoc");
-        }
-    } else {
-        if (i2cReady) {
-            ESP_LOGE(TAG, "khong tao duoc thiet bi I2C 0x%02X", kImuAddr);
-        }
-    }
-
-    // The touch panel shares the bus with the IMU and the RTC, so it borrows a
-    // Device the application owns, exactly like the IMU above.
-    //
-    // 400 kHz, not the 100 kHz that gets copied out of older Waveshare
-    // examples. Section 4.5 of the CST816S datasheet gives the chip a
-    // 10 kHz..400 kHz range and section 6.b recommends 400 kHz as the maximum
-    // for reliable communication, and i2c-bus-design.md section 3 already
-    // budgets this device at 400 kHz. A device speed is per-device on this
-    // driver, so nothing else on the bus is affected either way.
-    static i2c::Device        touchDev;
-    static touch::TouchManager touchMgr;
-    if (i2cReady && i2cBus.createDevice(kTouchAddr, 400000, touchDev) == ESP_OK) {
-        touch::Wiring twire{};  // the defaults already describe V2.1
-
-        touch::Behavior thow{};
-        // BRING-UP ONLY. Prints every frame as raw hex plus its decode, which
-        // is what settles the orientation flags and the event-flag semantics
-        // from a captured log instead of from a guess. Turn this off once the
-        // numbers are known: at 100 Hz during a drag it changes the timing it
-        // is measuring.
-        thow.logFrames = true;
-
-        touch::Geometry tgeo{};
-        // Deliberately the IDENTITY, and this is the one thing here that is
-        // expected to be wrong.
-        //
-        // The digitiser reports in the glass's own frame, and nothing in any
-        // document says how that lines up with what the ST7789 puts on screen
-        // (dwire/dcfg currently ask for mirrorX and mirrorY). Guessing would
-        // produce a panel that responds in a mirror image -- subtly wrong, and
-        // hard to attribute to any one of the three flags. So it starts as the
-        // identity, which is OBVIOUSLY wrong, and thow.logFrames prints
-        // raw(x,y) -> (x,y) for every touch: one press in a known corner names
-        // the right combination, and it becomes three booleans here.
-        //
-        // The LCD memory gap (display::Geometry::yGap = 20) is NOT part of
-        // this. It describes where the visible window sits inside the ST7789's
-        // 240x320 of GRAM, not where a finger is on the glass.
-        tgeo.orientation.rawWidth  = dcfg.geometry.width;
-        tgeo.orientation.rawHeight = dcfg.geometry.height;
-        tgeo.limits.width          = dcfg.geometry.width;
-        tgeo.limits.height         = dcfg.geometry.height;
-
-        if (touchMgr.init(touchDev, twire, thow, tgeo) == ESP_OK
-            && touchMgr.start() == ESP_OK) {
-            // Self-proving bring-up, like buzzerSelfTest() and logScan() above.
-            // The last argument asks the operator to touch the screen; frames
-            // that arrive during that window are counted and printed.
-            touch::SelfTestResult tst{};
-            touchMgr.runSelfTest(tst, 4000);
-
-            if (!tst.intIdleLevelOk) {
-                ESP_LOGE(TAG, "INT GPIO14 khong nghi o muc mong doi -- moi ngat sau day "
-                              "deu dang ngo");
-            }
-            if (!tst.touchObserved) {
-                ESP_LOGW(TAG, "khong nhan duoc frame nao. Neu ban CO cham man hinh thi "
-                              "xem lai IRQ (0xFA) va day noi INT, khong phai code doc frame");
-            }
-        } else {
-            ESP_LOGE(TAG, "cam ung khong khoi tao duoc");
-        }
-    } else if (i2cReady) {
-        ESP_LOGE(TAG, "khong tao duoc thiet bi I2C 0x%02X (cam ung)", kTouchAddr);
-    }
-
-    // Buttons last: a button already held down at start() is caught by the
-    // very first poll, and everything that reacts to it -- the buzzer, the
-    // calibration gesture -- must already exist by then.
-    ESP_ERROR_CHECK(btn.addButton(bwire, bhow));
-    ESP_ERROR_CHECK(btn.start());
+void logHelp(const board::Board& b)
+{
+    const button::ButtonBehavior& bhow = b.buttonBehavior();
 
     ESP_LOGI(TAG, "san sang. Nut GPIO%d, coi GPIO%d",
-             static_cast<int>(kButtonPin), static_cast<int>(kBuzzerPin));
+             static_cast<int>(board::kButtonPin),
+             static_cast<int>(board::kBuzzerPin));
     ESP_LOGI(TAG, "  cham xuong   -> bip ngan NGAY (~20ms, chi qua debounce)");
     ESP_LOGI(TAG, "  double click -> hai tieng len giong");
     ESP_LOGI(TAG, "  giu %" PRIu32 "ms   -> bao thuc lap vo han (click luc nay bi bo qua)",
@@ -445,43 +157,83 @@ extern "C" void app_main(void)
                   "click; no khong keu, tieng bip da phat luc cham xuong roi",
              bhow.doubleClickMs);
 
-    // Drain BOTH queues. Waiting forever on the button one left the IMU queue
-    // to fill up and start dropping events -- which is exactly what the
-    // "queue day, bo su kien 0" warnings were saying.
+    if (b.imuReady()) {
+        ESP_LOGI(TAG, "nang co tay len ngang mat -> se keu mot tieng bip");
+    }
+}
+
+// The bring-up loop. Drains every queue and prints what it finds.
+//
+// This is what components/ui will replace: once the UI task exists it becomes
+// the reader of these queues and of the wrist topic, and app_main goes back to
+// doing nothing at all. Until then this loop is the only consumer, and it is
+// the reason the touch and IMU queues do not silently overflow.
+void runDiagnosticLoop(board::Board& b, app::Services& services, ui::UiManager& ui,
+                       background::DaemonHost& d)
+{
     button::ButtonEventMsg msg;
     uint32_t               lastTouchDiagMs = 0;
+
+    uint32_t lastUiDiagMs = 0;
+
+    // DRAIN EVERY QUEUE ON EVERY PASS, and never block on just one of them.
+    // Waiting forever on the button queue once let the IMU queue fill up and
+    // start dropping -- which is exactly what the "queue day, bo su kien 0"
+    // warnings in the log were saying. The button wait below carries a 100 ms
+    // timeout for that reason, not for responsiveness.
     for (;;) {
+        // The wrist topic is NOT read here any more: the UI task reads it, in
+        // the UI task, through wristStatusLine(). Two readers would be legal --
+        // each owns its own cursor -- but one of them putting it on the screen
+        // is the point of the exercise.
+
+        // --- raw driver queues ---
         imu::ImuEventMsg iev;
-        while (imuMgr.waitEvent(iev, 0)) {
+        while (b.imu().waitEvent(iev, 0)) {
             ESP_LOGI(TAG, "IMU  %-15s  t=%" PRIu32 " ms", imuEventName(iev.type),
                      iev.timestampMs);
         }
 
-        // Drained the way TouchLvglAdapter will drain it once LVGL is wired up:
-        // pop until empty, every pass. Move collapses inside the tracker, so a
-        // drag produces one entry per pass here rather than one per interrupt.
-        touch::TouchTransition tt;
-        while (touchMgr.popTransition(tt)) {
-            ESP_LOGI(TAG, "CHAM %-4s  (%3d,%3d)  seq=%" PRIu32 "  t=%" PRIu32 " ms%s",
-                     touch::toString(tt.kind), static_cast<int>(tt.x),
-                     static_cast<int>(tt.y), tt.sequence, tt.timestampMs,
-                     tt.synthetic ? "   [tu sinh]" : "");
-        }
+        // THE TOUCH QUEUE IS NOT DRAINED HERE. It has exactly one consumer, and
+        // that consumer is the LVGL input callback in the UI task.
+        //
+        // This loop used to pop it too, "just for logging", and that was a real
+        // bug with a very confusing symptom: a vertical swipe off the edge of
+        // the screen would sometimes leave the touch stuck down, and only the
+        // NEXT touch would release it.
+        //
+        // popTransition() CONSUMES. Two consumers race, and whoever wins steals
+        // the event. When this loop won the Up, LVGL never saw it and stayed at
+        // LV_INDEV_STATE_PRESSED forever. It showed up on fast swipes because
+        // this loop drains the WHOLE queue every ~100 ms while the UI task polls
+        // at ~31 fps, so a burst of Moves followed quickly by an Up was very
+        // likely to be scooped up here in one sweep.
+        //
+        // Nothing is lost by removing it: touch::Behavior::logFrames already
+        // prints every frame as raw hex plus `raw(x,y) -> (x,y)` from the touch
+        // task, which is what the orientation bring-up actually needs.
 
         // Counters, on a slow timer. The per-frame detail is in the raw log
         // above; this is the summary that answers "is the release timeout
         // right" and "is anything being dropped".
-        if (touchMgr.isRunning()) {
-            const uint32_t nowTick = xTaskGetTickCount() * portTICK_PERIOD_MS;
-            if (nowTick - lastTouchDiagMs >= 10000) {
-                lastTouchDiagMs = nowTick;
-                touchMgr.logDiagnostics("dinh ky 10 s");
-            }
+        const uint32_t nowTick = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        if (b.touch().isRunning() && nowTick - lastTouchDiagMs >= 10000) {
+            lastTouchDiagMs = nowTick;
+            b.touch().logDiagnostics("dinh ky 10 s");
+        }
+        if (nowTick - lastUiDiagMs >= 10000) {
+            lastUiDiagMs = nowTick;
+            ui.logDiagnostics("dinh ky 10 s");
+            // Rides the same timer but prints nothing while the bus is clean,
+            // so it costs no log space until it has something to say.
+            b.logBusHealth("dinh ky 10 s");
+            d.logDiagnostics("dinh ky 10 s");
         }
 
-        if (!btn.waitEvent(msg, 100)) {
-            continue;  // just a timeout: go back and check the IMU queue
+        if (!b.button().waitEvent(msg, 100)) {
+            continue;  // just a timeout: go back and check the other queues
         }
+
         // timestampMs      = when the FSM reached its conclusion
         // pressTimestampMs = when the user started pressing
         // The difference between them is the latency of that event type.
@@ -493,20 +245,160 @@ extern "C" void app_main(void)
         // The alarm never ends on its own, so releasing the button is what stops
         // it. silence() outranks nothing -- stop always wins.
         if (msg.event == button::ButtonEvent::LONG_PRESS_RELEASE) {
-            buz.silence();
+            b.buzzer().silence();
             continue;
+        }
+
+        // BACK IS THE BUTTON, not a swipe -- for now, and deliberately.
+        //
+        // touch::Geometry is still the identity and expected to be wrong, so an
+        // edge-swipe gesture would be unreliable in a way that is hard to tell
+        // apart from a framework bug. A physical button always works, so the
+        // user can never be stranded inside an app even if every tap lands in
+        // the mirror image of where it was aimed. Swipe-back is worth adding
+        // once the orientation is settled.
+        if (msg.event == button::ButtonEvent::CLICK) {
+            ui.post({ui::UiCommandType::GO_BACK, 0, 0, 0});
+        } else if (msg.event == button::ButtonEvent::DOUBLE_CLICK) {
+            ui.post({ui::UiCommandType::GO_HOME, 0, 0, 0});
         }
 
         if (const buzzer::Pattern* sound = soundFor(msg.event)) {
             // Returns ESP_ERR_TIMEOUT if the command queue is full, which only
             // happens when someone presses far faster than a pattern can play.
             // Dropping a beep is the right answer there: this loop must not block.
-            const esp_err_t err = buz.play(*sound);
+            const esp_err_t err = b.buzzer().play(*sound);
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "play() bo qua: %s", esp_err_to_name(err));
             }
         }
     }
+}
 
-    // unreachable: the loop above never exits
+}  // namespace
+
+extern "C" void app_main(void)
+{
+    // Static, not stack: app_main's frame is small and these own every driver
+    // task's context. They live until reboot by design -- see the note on
+    // runtime restart in doc-design/app-architecture.md section 15.
+    static board::Board   hw;
+    static app::Services  services;
+    static ui::UiManager  uiRuntime;
+    static ui::AppRegistry<6> registry;
+
+    // 0. What the PREVIOUS boot left behind. First, so that if bring-up itself
+    //    is what keeps dying, the message naming the cause is already out
+    //    before the thing that dies runs again.
+    forensics::reportBoot();
+
+    // 1. Hardware. Never ESP_ERROR_CHECK: aborting reboots the chip and the one
+    //    useful error message scrolls past inside an endless boot loop.
+    const esp_err_t herr = hw.initDevices();
+    if (herr != ESP_OK) {
+        ESP_LOGE(TAG, "khoi tao phan cung that bai: %s -- van chay tiep",
+                 esp_err_to_name(herr));
+    }
+
+    // 2. Domain layer. MUST be between initDevices() and startSensors(): the
+    //    fan-out is sealed by the latter. board.hpp explains why this is two
+    //    calls instead of one.
+    if (services.attach(hw) != ESP_OK) {
+        ESP_LOGE(TAG, "gan service that bai -- du lieu cam bien se khong toi UI");
+    }
+
+    // 3. Product policy, wired before anything can fire.
+    services.wrist().setEventCallback(onWristEvent, &hw.buzzer());
+
+    // 4. Apps and their daemons.
+    //
+    //    CONSTRUCTED AND REGISTERED HERE, and the position is load-bearing in
+    //    two ways that were both wrong in the first version:
+    //
+    //    a) BEFORE startSensors(). A daemon attaches itself to the IMU fan-out
+    //       in onStart(), and startSensors() SEALS that fan-out. Registering
+    //       afterwards would have every daemon silently fail to subscribe.
+    //
+    //    b) OUTSIDE the display check below. A watch whose screen failed to
+    //       come up should still count activity -- the background half of an
+    //       app has nothing to do with whether anyone can see it. Putting this
+    //       inside the display branch tied the two together for no reason.
+    //
+    //    Apps are handed only what they need: WristApp gets two topics, the
+    //    daemon gets the sample stream, DiagApp gets a snapshot function. None
+    //    of them gets a Board, a Services, or a driver -- app.hpp rule 6,
+    //    enforced by what is absent from these constructors.
+    static apps::WristDaemon wristDaemon{};
+    static apps::WristApp    wristApp{services.wrist().state(), wristDaemon.state()};
+    static apps::TouchApp    touchApp;
+    static apps::DiagApp     diagApp{fillDiagSnapshot, &uiRuntime};
+
+    // Designated initialisers, and add() is [[nodiscard]] -- the first version
+    // of these lines threw the result away while the header said not to, which
+    // would have made a full registry lose an app in silence.
+    const bool registered =
+        registry.add({.id     = "wrist",
+                      .title  = "Co tay",
+                      .icon   = LV_SYMBOL_EYE_OPEN,
+                      .ui     = &wristApp,
+                      .daemon = &wristDaemon})
+        && registry.add({.id    = "touch",
+                         .title = "Cham",
+                         .icon  = LV_SYMBOL_GPS,
+                         .ui    = &touchApp})
+        && registry.add({.id    = "diag",
+                         .title = "Chan doan",
+                         .icon  = LV_SYMBOL_SETTINGS,
+                         .ui    = &diagApp});
+    if (!registered) {
+        ESP_LOGE(TAG, "registry day -- co app khong xuat hien trong launcher");
+    }
+
+    // 5. Background halves get their tasks now: while the fan-out still accepts
+    //    subscribers, and long before any UI exists.
+    //
+    //    ONE subscriber goes into the fan-out no matter how many daemons there
+    //    are -- the host itself. It copies each sample into one queue per
+    //    daemon and returns. That is what keeps app code out of the IMU task
+    //    and keeps the sensor's cost proportional to the NUMBER of daemons
+    //    rather than to what any of them does.
+    static background::DaemonHost daemons{};
+
+    ESP_LOGI(TAG, "%u daemon dang ky", ui::registerDaemons(registry, daemons));
+
+    if (!hw.imuSamples().add(&daemons)) {
+        ESP_LOGE(TAG, "DaemonHost khong vao duoc luong IMU -- moi daemon se doi mai");
+    }
+    ESP_ERROR_CHECK_WITHOUT_ABORT(daemons.start());
+
+    // 6. Sensors run. This seals the fan-out: no more subscribers after here.
+    const esp_err_t serr = hw.startSensors();
+    if (serr != ESP_OK) {
+        ESP_LOGW(TAG, "cam bien khong day du: %s", esp_err_to_name(serr));
+    }
+
+    // 7. The UI runtime. Last, because it needs a live display and the topics
+    //    it reads must already be publishing.
+    //
+    //    From here on the UI task is the ONLY task allowed to call LVGL.
+    //    CONFIG_LV_OS_NONE=y means lv_lock() is a no-op, so a stray call from
+    //    another task does not deadlock or assert -- it corrupts the object tree
+    //    and reboots at random, much later. post() is the only way in, and
+    //    ui::assertUiContext() is what says so out loud when it is violated.
+    if (hw.displayReady()) {
+        const esp_err_t uerr = uiRuntime.init(
+            hw.display(), hw.touchReady() ? &hw.touch() : nullptr, registry);
+        if (uerr == ESP_OK) {
+            if (uiRuntime.start() != ESP_OK) {
+                ESP_LOGE(TAG, "UI task khong chay duoc");
+            }
+        } else {
+            ESP_LOGE(TAG, "UI khong khoi tao duoc: %s", esp_err_to_name(uerr));
+        }
+    } else {
+        ESP_LOGW(TAG, "khong co man hinh -- bo qua UI, daemon van chay");
+    }
+
+    logHelp(hw);
+    runDiagnosticLoop(hw, services, uiRuntime, daemons);
 }
